@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Juego Llama</title>
+
+  <link rel="preload" as="audio" href="/assets/llama/supermariobros.mp3">
+  <link rel="preload" as="audio" href="/assets/llama/saltosonido.mp3">
+  <link rel="stylesheet" href="/style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+
+  <script>
+    (function () {
+      function unlockAudio() {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        var ctx = new AC();
+        var buf = ctx.createBuffer(1, 1, 22050);
+        var src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+        window._phaserAudioCtx = ctx;
+        document.removeEventListener('touchstart', unlockAudio, true);
+        document.removeEventListener('touchend',   unlockAudio, true);
+        document.removeEventListener('click',      unlockAudio, true);
+      }
+      document.addEventListener('touchstart', unlockAudio, { capture: true, once: true, passive: true });
+      document.addEventListener('touchend',   unlockAudio, { capture: true, once: true, passive: true });
+      document.addEventListener('click',      unlockAudio, { capture: true, once: true, passive: true });
+    })();
+  </script>
+</head>
+<body>
+  <div id="game-wrapper">
+    <div id="game-container"></div>
+
+    <!-- Controles táctiles: visibles en móvil portrait y landscape -->
+    <div id="mobile-controls">
+
+      <!-- D-pad izquierdo: ← → para moverse + ↑ ↓ para menú -->
+      <div id="dpad">
+        <button id="btn-up"    class="ctrl-btn ctrl-sm" aria-label="Arriba">▲</button>
+        <div id="dpad-lr">
+          <button id="btn-left"  class="ctrl-btn" aria-label="Izquierda">◀</button>
+          <button id="btn-right" class="ctrl-btn" aria-label="Derecha">▶</button>
+        </div>
+        <button id="btn-down"  class="ctrl-btn ctrl-sm" aria-label="Abajo">▼</button>
+      </div>
+
+      <!-- Botones derecha: START (menú) + B (fuego) + A (salto) -->
+      <div id="action-btns">
+        <button id="btn-start" class="ctrl-btn ctrl-start" aria-label="Start">START</button>
+        <div id="action-ab">
+          <button id="btn-fire" class="ctrl-btn ctrl-b ctrl-b--disabled" aria-label="Fuego">B</button>
+          <button id="btn-jump" class="ctrl-btn ctrl-a"                  aria-label="Saltar">A</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/phaser@3.90.0/dist/phaser.min.js"></script>
+  <script type="module" src="/script.js"></script>
+</body>
+</html>
