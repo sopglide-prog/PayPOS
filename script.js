@@ -96,10 +96,7 @@ async function renderOverviewCajas(s) {
   }
 
   // Admin: cargar qué cajas tienen turno abierto en Supabase
-  const esCaja1Actual =
-    !!(s?.caja && s.caja.replace(/[^0-9]/g, '') === '1');
-
-  const esAdmin = !!(s?.admin) || esCaja1Actual;
+  const esAdmin = !!(s?.admin) || esCajaSupervisora(s);
   if (esAdmin && supabaseClient) {
     try {
       const { data: abiertos } = await supabaseClient
@@ -714,8 +711,8 @@ function abrirInventarios() {
   loadInventarios('hoy');
 }
 function abrirReportes() {
-  if (!esCaja1()) {
-    showToast('🔒 No estás autorizado para ver reportes', 3500, 'warning');
+  if (!esCajaSupervisora()) {
+    showToast('🔒 Solo Caja 1 o Caja 5 pueden ver reportes', 3500, 'warning');
     return;
   }
   repResetUI();
@@ -2247,14 +2244,15 @@ function sessionCaja(s = getCurrentSession()) {
   return String(s?.caja || '').toLowerCase().trim();
 }
 
-function esCaja1(s = getCurrentSession()) {
-  return sessionCaja(s) === 'caja 1';
+function esCajaSupervisora(s = getCurrentSession()) {
+  const numeroCaja = sessionCaja(s).replace(/[^0-9]/g, '');
+  return numeroCaja === '1' || numeroCaja === '5';
 }
 
 function actualizarPermisosDeCaja(s = getCurrentSession()) {
   const filtroTodas = document.getElementById('ord-filter-todas');
   const reportePorCaja = document.querySelector('.rep-option-btn[data-tipo="cajas"]');
-  const puedeVerGeneral = esCaja1(s);
+  const puedeVerGeneral = esCajaSupervisora(s);
 
   if (filtroTodas) {
     filtroTodas.style.display = puedeVerGeneral ? '' : 'none';
@@ -2419,7 +2417,7 @@ async function doLogin() {
       btn.disabled = false; btn.textContent = 'Ingresar →'; return;
     }
     if (!data) {
-      errEl.textContent = 'No existe un usuario activo con esos datos. Usa usuario caja1 y contraseña 123.';
+      errEl.textContent = 'No existe un usuario activo con esos datos. Revisa tu usuario y contraseña.';
       btn.disabled = false; btn.textContent = 'Ingresar →'; return;
     }
     const tempS = { usuario: data.usuario, nombre: data.nombre, caja: data.caja };
@@ -2534,7 +2532,7 @@ async function loadInventarios(filtro) {
   try {
     const _invSess = getCurrentSession();
     const _invCaja = (_invSess?.caja || '').toLowerCase().trim();
-    const _invCanSeeAll = esCaja1(_invSess);
+    const _invCanSeeAll = esCajaSupervisora(_invSess);
     let q = supabaseClient.from('ventas').select('*').eq('anulado', false);
     if (filtro === 'hoy') {
       const hoy = new Date().toISOString().slice(0,10);
@@ -2641,7 +2639,7 @@ async function loadReportes() {
       .eq('anulado', false)
       .order('creado_en', { ascending: false })
       .limit(5000);
-    if (!esCaja1(s)) q = q.eq('caja', s?.caja || '');
+    if (!esCajaSupervisora(s)) q = q.eq('caja', s?.caja || '');
     const { data, error } = await q;
     if (error) throw error;
     repVentas = data || [];
@@ -3135,7 +3133,7 @@ document.getElementById('ord-close').addEventListener('click', () =>
 
 document.getElementById('ord-filter-mia').addEventListener('click',    () => { ordFiltroCaja='mia';    syncOrdFilters(); loadOrdenes(); });
 document.getElementById('ord-filter-todas').addEventListener('click',  () => {
-  if (!esCaja1()) return;
+  if (!esCajaSupervisora()) return;
   ordFiltroCaja='todas'; syncOrdFilters(); loadOrdenes();
 });
 document.getElementById('ord-search').addEventListener('input', renderOrdenes);
@@ -3155,8 +3153,8 @@ async function loadOrdenes() {
   try {
     const s = getCurrentSession();
     let q = supabaseClient.from('ventas').select('*').order('creado_en', { ascending: false });
-   
-    if (!esCaja1(s)) {
+
+    if (!esCajaSupervisora(s)) {
       ordFiltroCaja = 'mia';
       q = q.eq('caja', s?.caja || '');
     }
@@ -3207,7 +3205,7 @@ function renderOrdenes() {
 
   // Determine which cajas can anular
   const _sess = getCurrentSession();
-  const _canAnular = esCaja1(_sess);
+  const _canAnular = esCajaSupervisora(_sess);
 
   listEl.innerHTML = rows.map((r, i) => {
     const num       = getOrderReference(r.id);
@@ -3267,8 +3265,8 @@ function renderOrdenes() {
 }
 
 async function anularOrden(id, btn) {
-  if (!esCaja1()) {
-    showToast('Solo Caja 1 puede anular órdenes', 2500);
+  if (!esCajaSupervisora()) {
+    showToast('Solo Caja 1 o Caja 5 pueden anular órdenes', 2500);
     return;
   }
   if (!id || id === 'null' || id === 'undefined') {
@@ -3318,8 +3316,8 @@ let crTurnoActivo   = null;
 
 function abrirMonitor() {
   const _ms = getCurrentSession();
-  if (!_ms || !(_ms.caja && _ms.caja.replace(/[^0-9]/g,'') === '1')) {
-    showToast('⚠️ Solo Caja 1 puede ver el monitor', 2500); return;
+  if (!esCajaSupervisora(_ms)) {
+    showToast('⚠️ Solo Caja 1 o Caja 5 pueden ver el monitor', 2500); return;
   }
   if (monitorInterval) clearInterval(monitorInterval);
   cajaShowStep('caja-step-monitor');
@@ -3365,7 +3363,7 @@ function renderMonitorList(turnos) {
       ? new Date(t.abierta_en).toLocaleTimeString('es-BO', {hour:'2-digit', minute:'2-digit'})
       : '—';
     const esMia = s && t.cajero === s.usuario;
-    const esAdminMonitor = !!(s?.admin);
+    const esAdminMonitor = esCajaSupervisora(s) || !!(s?.admin);
     return `<div class="monitor-card">
       <div class="monitor-card-left">
         <div class="monitor-card-caja">${t.caja || '—'}</div>
@@ -3589,7 +3587,7 @@ document.getElementById('cr-btn-confirmar').addEventListener('click', async () =
     return;
   }
 
-  
+
   // Imprimir cierre remoto
   const fmtDifP = d => d > 0
     ? `SOBRA Bs ${fmt(Math.abs(d))}`
