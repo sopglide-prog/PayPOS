@@ -1,3175 +1,3726 @@
-// =====================================================
-//  Juego Llama — Piso infinito + llama jugadora
-// =====================================================
+/* Supabase bootstrap */
+const supabaseUrl = "https://vxtefnajeqwwditdwwcs.supabase.co";
+      const supabaseKey =
+          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ4dGVmbmFqZXF3d2RpdGR3d2NzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg0Mzc5MjEsImV4cCI6MjA4NDAxMzkyMX0.HFURBIenpBqaqkiF-CGsdBoTTqhdqFznDU8ntITnIWY";
+      let supabaseClient;
+      try {
+          supabaseClient = supabase.createClient(supabaseUrl, supabaseKey);
+      } catch (e) {
+          console.warn("Supabase no disponible:", e);
+      }
 
-// ── Mini-cliente Supabase (sin paquetes, solo fetch) ──────────────────────────
-function createClient(url, key) {
-  const headers = {
-    apikey: key,
-    Authorization: `Bearer ${key}`,
-    'Content-Type': 'application/json',
-    Prefer: 'return=representation',
+/* POS application */
+const DOCK_DEFAULTS = [
+  {name:'Reportes',   icon:'https://img.icons8.com/?size=80&id=tIA2ws1t2kbo&format=png&color=000000', url:'javascript:abrirReportes()'},
+  {name:'Abrir Caja', icon:'https://img.icons8.com/?size=80&id=q7ZjJsoiJjH3&format=png&color=000000', url:'javascript:abrirCaja()'},
+  {name:'Inventarios',icon:'https://img.icons8.com/?size=80&id=112521&format=png&color=000000',        url:'javascript:abrirInventarios()'},
+  {name:'Órdenes',    icon:'https://img.icons8.com/?size=80&id=qOH8AEbMnHas&format=png&color=000000',  url:'javascript:abrirOrdenes()'},
+];
+
+function loadDock() {
+  try {
+    const s = JSON.parse(localStorage.getItem('sopglide_dock_v2'));
+    if (Array.isArray(s) && s.length === DOCK_DEFAULTS.length && s[0].icon !== undefined) return s;
+  } catch(_){}
+  return DOCK_DEFAULTS.map(d => ({...d}));
+}
+function saveDock(apps) { localStorage.setItem('sopglide_dock_v2', JSON.stringify(apps)); }
+
+let dockApps = loadDock();
+let selectedIdx = null;
+let editIdx = null;
+
+// Variables de sesión y turno — declaradas aquí para evitar TDZ
+let _sessionCache = null;
+let _turnoCache   = null;
+
+/* ========== TURNO DE CAJA ========== */
+// Turno en memoria únicamente — nunca localStorage
+// Así siempre refleja el estado real de Supabase al recargar
+function getTurno()    { return _turnoCache; }
+function setTurno(t)   { _turnoCache = t; }
+function clearTurno()  { _turnoCache = null; }
+
+/*
+ * La tabla ventas no tiene una columna de número de orden.
+ * Usamos el ID que Supabase ya genera como referencia estable de la
+ * comanda. Así dos cajas nunca imprimen el mismo identificador por
+ * competir con COUNT(*) o con localStorage.
+ */
+function getOrderReference(id) {
+  const value = String(id ?? '')
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .toUpperCase();
+  if (!value) return '—';
+  return value.length > 6 ? value.slice(-6) : value.padStart(3, '0');
+}
+
+function cajaShowStep(id) {
+  ['caja-step1','caja-step2','caja-step-cierre','caja-step-monitor','caja-step-cierre-remoto'].forEach(s => {
+    document.getElementById(s).classList.toggle('active', s === id);
+  });
+}
+
+async function abrirCaja() {
+  const s = getCurrentSession();
+  if (!s) { showToast('⚠️ Inicia sesión primero', 2500); return; }
+  document.getElementById('caja-modal').classList.add('open');
+  cajaShowStep('caja-step1');
+  await renderOverviewCajas(s);
+}
+
+async function renderOverviewCajas(s) {
+  const list = document.getElementById('overview-cajas-list');
+  if (!list) return;
+  list.innerHTML = '<div style="text-align:center;color:var(--text-dim);font-size:13px;padding:10px;">Cargando…</div>';
+
+  // Sincronizar turno desde Supabase — consulta el turno MÁS RECIENTE sin filtrar estado
+  // para detectar cierres remotos aunque el local diga 'abierta'
+  let turno = getTurno();
+  let cajasAbiertasSet = new Set();
+  if (supabaseClient && s.usuario) {
+    try {
+      const { data: turnoSupa, error: turnoErr } = await supabaseClient
+        .from('turnos_caja').select('*')
+        .eq('cajero', s.usuario)
+        .order('abierta_en', { ascending: false }).limit(1).maybeSingle();
+      if (!turnoErr) {
+        if (turnoSupa && turnoSupa.estado === 'abierta') {
+          turno = turnoSupa; setTurno(turnoSupa);
+        } else {
+          // Turno cerrado o inexistente en Supabase → limpiar caché local
+          turno = null; clearTurno();
+        }
+      }
+    } catch(_) {}
+  }
+
+  // Admin: cargar qué cajas tienen turno abierto en Supabase
+  const esCaja1Actual =
+    !!(s?.caja && s.caja.replace(/[^0-9]/g, '') === '1');
+
+  const esAdmin = !!(s?.admin) || esCaja1Actual;
+  if (esAdmin && supabaseClient) {
+    try {
+      const { data: abiertos } = await supabaseClient
+        .from('turnos_caja').select('caja').eq('estado', 'abierta');
+      (abiertos || []).forEach(t => { if (t.caja) cajasAbiertasSet.add(t.caja); });
+    } catch(_) {}
+  }
+
+  const miTurnoAbierto = turno && turno.cajero === s.usuario && turno.estado === 'abierta';
+  let cajerasPorCaja = {};
+  if (supabaseClient) {
+    try {
+      const { data } = await supabaseClient.from('cajeras').select('nombre,caja').eq('activo', true);
+      (data||[]).forEach(c => { if (c.caja) cajerasPorCaja[c.caja] = c.nombre; });
+    } catch(_){}
+  }
+  let cajas = Object.keys(cajerasPorCaja);
+  if (!cajas.length) cajas = ['Caja 1','Caja 2','Caja 3','Caja 4'];
+  cajas = cajas.sort();
+
+  list.innerHTML = cajas.map(caja => {
+    const nombre = cajerasPorCaja[caja] || '—';
+    const esMia = caja === s.caja;
+    const num = caja.replace(/[^0-9]/g,'') || caja;
+    const barraNombre = caja === 'Caja 1' || caja === 'Caja 2'
+      ? 'Barra Principal'
+      : caja === 'Caja 3'
+        ? 'Barra VIP'
+        : caja === 'Caja 4'
+          ? 'Barra Cholet'
+          : '';
+    const barraBadge = barraNombre
+      ? `<span style="font-size:9px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:rgba(180,210,255,0.80);background:rgba(100,140,255,0.10);border:1px solid rgba(140,170,255,0.22);border-radius:6px;padding:2px 7px;margin-top:5px;display:inline-block;">${barraNombre}</span>`
+      : '';
+    const icono = caja === 'Caja 3' || caja === 'Caja 4'
+      ? '🍹'
+      : `<img src="https://img.icons8.com/?size=100&id=w1h9Auk9h4W9&format=png&color=FFFFFF" style="width:24px;height:24px;">`;
+
+    // Caja de otra cajera — solo admin puede interactuar
+    if (!esMia && !esAdmin) {
+      return `<div class="caja-card-horiz" style="opacity:.42;pointer-events:none;">
+        <div class="caja-abrir-square" style="cursor:default;">
+          <span style="font-size:26px;line-height:1;">${icono}</span>
+          <span style="font-size:11px;opacity:.7;">Caja</span>
+        </div>
+        <div class="caja-card-right">
+          <div class="caja-card-num">${num}</div>
+          <div class="caja-card-cajera">${nombre}</div>
+          ${barraBadge}
+        </div>
+      </div>`;
+    }
+
+    // Admin ve cajas ajenas: si está abierta → botón cerrar; si está cerrada → dimmed
+    if (!esMia && esAdmin) {
+      if (cajasAbiertasSet.has(caja)) {
+        return `<div class="caja-card-horiz" style="border-color:rgba(220,80,80,0.4);">
+          <button class="caja-abrir-square" style="background:linear-gradient(135deg,rgba(150,45,45,0.95),rgba(190,65,65,0.95));box-shadow:0 6px 22px rgba(150,45,45,0.42);border-color:rgba(220,80,80,0.5);" onclick="initCierreRemotoDesdeOverview('${caja}')">
+            <img src="https://img.icons8.com/?size=100&id=w1h9Auk9h4W9&format=png&color=FFFFFF" style="width:26px;height:26px;">
+            <span>Cerrar<br>Caja</span>
+          </button>
+          <div class="caja-card-right">
+            <div class="caja-card-num">${num}</div>
+            <div class="caja-card-cajera">${nombre}</div>
+            ${barraBadge}
+          </div>
+        </div>`;
+      }
+      return `<div class="caja-card-horiz" style="opacity:.45;pointer-events:none;">
+        <div class="caja-abrir-square" style="cursor:default;">
+          <span style="font-size:26px;line-height:1;">${icono}</span>
+          <span style="font-size:11px;opacity:.7;">Cerrada</span>
+        </div>
+        <div class="caja-card-right">
+          <div class="caja-card-num">${num}</div>
+          <div class="caja-card-cajera">${nombre}</div>
+          ${barraBadge}
+        </div>
+      </div>`;
+    }
+
+    // Propia caja — turno abierto → cerrar
+    if (miTurnoAbierto) {
+      return `<div class="caja-card-horiz" style="border-color:rgba(220,80,80,0.5);">
+        <button class="caja-abrir-square" style="background:linear-gradient(135deg,rgba(150,45,45,0.95),rgba(190,65,65,0.95));box-shadow:0 6px 22px rgba(150,45,45,0.42);border-color:rgba(220,80,80,0.5);" onclick="irACierre()">
+          <img src="https://img.icons8.com/?size=100&id=w1h9Auk9h4W9&format=png&color=FFFFFF" style="width:26px;height:26px;">
+          <span>Cerrar<br>Caja</span>
+        </button>
+        <div class="caja-card-right">
+          <div class="caja-card-num">${num}</div>
+          <div class="caja-card-cajera">${nombre}</div>
+          ${barraBadge}
+        </div>
+      </div>`;
+    }
+    // Propia caja — cerrada → abrir
+    return `<div class="caja-card-horiz">
+      <button class="caja-abrir-square" onclick="irAApertura()">
+        <span style="font-size:26px;line-height:1;">${icono}</span>
+        <span>Abrir<br>Caja</span>
+      </button>
+      <div class="caja-card-right">
+        <div class="caja-card-num">${num}</div>
+        <div class="caja-card-cajera">${nombre}</div>
+        ${barraBadge}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function irAApertura() {
+  const s = getCurrentSession();
+  document.getElementById('caja-monto-apertura').value = '';
+  const notaEl = document.getElementById('caja-apertura-nota');
+  if (notaEl) notaEl.value = '';
+  document.querySelectorAll('.caja-quick-btn').forEach(b => b.classList.remove('active'));
+  const resEl = document.getElementById('caja-step2-resumen');
+  if (resEl) resEl.style.display = 'none';
+  if (s) {
+    const num = s.caja ? s.caja.replace(/[^0-9]/g,'') || s.caja : '—';
+    const el = document.getElementById('caja-step2-cajaname');
+    const el2 = document.getElementById('caja-step2-cajero');
+    const elF = document.getElementById('caja-step2-fecha');
+    const elH = document.getElementById('caja-step2-hora');
+    if (el) el.textContent = 'Caja ' + num;
+    if (el2) el2.textContent = '👤 ' + (s.nombre || s.usuario);
+    const now = new Date();
+    if (elF) elF.textContent = now.toLocaleDateString('es-BO', {weekday:'long', day:'numeric', month:'long'});
+    if (elH) elH.textContent = now.toLocaleTimeString('es-BO', {hour:'2-digit', minute:'2-digit'});
+  }
+  cajaShowStep('caja-step2');
+  document.getElementById('caja-monto-apertura').focus();
+}
+
+function setCajaApertura(amount, btn) {
+  document.getElementById('caja-monto-apertura').value = amount;
+  document.querySelectorAll('.caja-quick-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const resEl = document.getElementById('caja-step2-resumen');
+  const resMontoEl = document.getElementById('caja-step2-resumen-monto');
+  if (resEl && resMontoEl) { resEl.style.display = 'block'; resMontoEl.textContent = 'Bs ' + fmt(amount); }
+}
+
+function previewCajaApertura() {
+  const monto = parseFloat(document.getElementById('caja-monto-apertura').value) || 0;
+  const resEl = document.getElementById('caja-step2-resumen');
+  const resMontoEl = document.getElementById('caja-step2-resumen-monto');
+  if (resEl && resMontoEl) { resEl.style.display = 'block'; resMontoEl.textContent = 'Bs ' + fmt(monto); }
+}
+
+function irACierre() {
+  const s = getCurrentSession();
+  const turno = getTurno();
+  if (!s || !turno) return;
+  const num = s.caja ? s.caja.replace(/[^0-9]/g,'') || s.caja : '—';
+  document.getElementById('caja-cierre-num').textContent = num;
+  document.getElementById('caja-cierre-name').textContent = s.nombre;
+  document.getElementById('caja-cierre-desde').textContent =
+    'Abierta desde ' + new Date(turno.abierta_en).toLocaleTimeString();
+  document.getElementById('cierre-efectivo').value = '';
+  document.getElementById('cierre-qr').value = '';
+  document.getElementById('cierre-tarjeta').value = '';
+  document.getElementById('caja-result-grid').style.display = 'none';
+  document.getElementById('caja-btn-calcular').style.display = 'block';
+  document.getElementById('caja-btn-confirmar-cierre').style.display = 'none';
+  cajaShowStep('caja-step-cierre');
+}
+
+function updateDockCajaLabel() {
+  const turno = getTurno();
+  const s = getCurrentSession();
+  const estaAbierta = turno && s && turno.cajero === s.usuario && turno.estado === 'abierta';
+  const idx = DOCK_DEFAULTS.findIndex(d => d.url === 'javascript:abrirCaja()');
+  if (idx >= 0) {
+    dockApps[idx].name = estaAbierta ? 'Cerrar Caja' : 'Abrir Caja';
+    renderDock();
+  }
+}
+
+// Botones apertura
+document.getElementById('caja-step1-cancel').addEventListener('click', () => {
+  document.getElementById('caja-modal').classList.remove('open');
+});
+document.getElementById('caja-btn-abrir').addEventListener('click', () => {
+  cajaShowStep('caja-step2');
+  document.getElementById('caja-monto-apertura').focus();
+});
+document.getElementById('caja-step2-back').addEventListener('click', () => cajaShowStep('caja-step1'));
+
+document.getElementById('caja-btn-confirmar-apertura').addEventListener('click', async () => {
+  const s = getCurrentSession();
+  if (!s) return;
+  const btn = document.getElementById('caja-btn-confirmar-apertura');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'ABRIENDO…';
+
+  const monto = parseFloat(document.getElementById('caja-monto-apertura').value) || 0;
+  const ahora = new Date().toISOString();
+  const turnoData = {
+    cajero: s.usuario, cajero_nombre: s.nombre, caja: s.caja,
+    monto_apertura: monto, estado: 'abierta', abierta_en: ahora
   };
 
-  function buildUrl(table, filters, extra) {
-    const params = [];
-    filters.forEach(([col, val]) => params.push(`${col}=eq.${encodeURIComponent(val)}`));
-    if (extra) params.push(extra);
-    return `${url}/rest/v1/${table}${params.length ? '?' + params.join('&') : ''}`;
-  }
-
-  function from(table) {
-    let _selectCols = '*';
-    let _filters    = [];
-    let _method     = 'GET';
-    let _body       = null;
-
-    const chain = {
-      select(cols) { _selectCols = cols; return chain; },
-      eq(col, val) { _filters.push([col, val]); return chain; },
-      update(data) { _method = 'PATCH'; _body = data; return chain; },
-      insert(data) { _method = 'POST';  _body = Array.isArray(data) ? data : [data]; return chain; },
-
-      // Terminal: .maybeSingle() → devuelve { data, error }
-      async maybeSingle() {
-        const reqUrl = buildUrl(table, _filters, `select=${encodeURIComponent(_selectCols)}&limit=1`);
-        try {
-          const res = await fetch(reqUrl, { method: 'GET', headers });
-          if (!res.ok) return { data: null, error: await res.json().catch(() => ({ message: res.statusText })) };
-          const arr = await res.json();
-          return { data: arr[0] ?? null, error: null };
-        } catch (e) { return { data: null, error: { message: e.message } }; }
-      },
-
-      // Hace la chain "awaitable" para update/insert sin terminal explícito
-      then(resolve, reject) {
-        const reqUrl = buildUrl(table, _filters);
-        fetch(reqUrl, { method: _method, headers, body: _body ? JSON.stringify(_body) : undefined })
-          .then(async res => {
-            if (res.status === 204) return resolve({ data: null, error: null });
-            const body = await res.json().catch(() => null);
-            return resolve(res.ok ? { data: body, error: null } : { data: null, error: body });
-          })
-          .catch(reject);
-      },
-    };
-    return chain;
-  }
-
-  return { from };
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
-const supabase = createClient(
-  'https://vxtefnajeqwwditdwwcs.supabase.co',
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ4dGVmbmFqZXF3d2RpdGR3d2NzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg0Mzc5MjEsImV4cCI6MjA4NDAxMzkyMX0.HFURBIenpBqaqkiF-CGsdBoTTqhdqFznDU8ntITnIWY'
-);
-
-// Guarda/acumula resultado por jugador en Supabase.
-// Tabla "partidas" necesita columnas: nombre (text, unique), gano (int), perdio (int), monedas_total (int)
-async function guardarPartida(nombre, monedas, resultado) {
   try {
-    // Buscar fila existente para este jugador
-    const { data: fila } = await supabase
-      .from('partidas')
-      .select('gano, perdio, monedas_total')
-      .eq('nombre', nombre)
-      .maybeSingle();
-
-    if (fila) {
-      // Jugador ya existe → incrementar contadores
-      const { error } = await supabase.from('partidas').update({
-        gano:          (fila.gano          || 0) + (resultado === 'gano'   ? 1 : 0),
-        perdio:        (fila.perdio        || 0) + (resultado === 'perdio' ? 1 : 0),
-        monedas_total: (fila.monedas_total || 0) + (monedas  || 0),
-      }).eq('nombre', nombre);
-      if (error) console.warn('Supabase update error:', error.message);
-    } else {
-      // Jugador nuevo → crear fila
-      const { error } = await supabase.from('partidas').insert([{
-        nombre,
-        gano:          resultado === 'gano'   ? 1 : 0,
-        perdio:        resultado === 'perdio' ? 1 : 0,
-        monedas_total: monedas || 0,
-      }]);
-      if (error) console.warn('Supabase insert error:', error.message);
+    if (!supabaseClient) {
+      throw new Error('No hay conexión con Supabase');
     }
+
+    const { data, error } = await supabaseClient
+      .from('turnos_caja')
+      .insert([turnoData])
+      .select('*')
+      .single();
+
+    if (error) {
+      // Si otra pestaña/caja ganó la carrera, mostrar el turno real
+      // en lugar de crear un turno local que no existe en Supabase.
+      if (error.code === '23505') {
+        const { data: turnoExistente } = await supabaseClient
+          .from('turnos_caja')
+          .select('*')
+          .eq('caja', s.caja)
+          .eq('estado', 'abierta')
+          .order('abierta_en', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (turnoExistente) {
+          setTurno(turnoExistente);
+          showToast(`⚠️ ${s.caja} ya está abierta`, 3500, 'warning');
+          document.getElementById('caja-modal').classList.remove('open');
+          updateDockCajaLabel();
+          return;
+        }
+      }
+      throw error;
+    }
+
+    if (!data?.id) throw new Error('Supabase no devolvió el turno creado');
+
+    setTurno(data);
+    document.getElementById('caja-modal').classList.remove('open');
+    updateDockCajaLabel();
+    showToast(`✅ Caja abierta con Bs ${fmt(monto)} de fondo`, 3000);
   } catch (e) {
-    console.warn('No se pudo guardar la partida:', e);
+    console.error('Error guardando turno:', e);
+    showToast(`⚠️ No se pudo abrir la caja: ${e.message || 'error de conexión'}`, 4500, 'warning');
+    await renderOverviewCajas(s);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'CONFIRMAR APERTURA';
   }
-}
+});
 
-// ─────────────────────────────────────────────────────
-//  NameScene — Pantalla de ingreso de nombre
-// ─────────────────────────────────────────────────────
-class NameScene extends Phaser.Scene {
-  constructor() { super({ key: 'NameScene' }); }
+// Botones cierre
+document.getElementById('caja-cierre-cancel').addEventListener('click', async () => {
+  const _scc = getCurrentSession();
+  if (_scc) { cajaShowStep('caja-step1'); await renderOverviewCajas(_scc); }
+  else document.getElementById('caja-modal').classList.remove('open');
+});
 
-  create() {
-    // Inyectar fuente retro si no está aún
-    if (!document.getElementById('press-start-font')) {
-      const lnk = document.createElement('link');
-      lnk.id   = 'press-start-font';
-      lnk.rel  = 'stylesheet';
-      lnk.href = 'https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap';
-      document.head.appendChild(lnk);
-    }
+document.getElementById('caja-btn-calcular').addEventListener('click', async () => {
+  const s = getCurrentSession();
+  const turno = getTurno();
+  if (!s || !turno) return;
 
-    // ─── Overlay de pantalla completa (position:fixed para iOS) ───
-    const screen = document.createElement('div');
-    screen.id = 'name-screen';
-    screen.style.cssText = `
-      position: fixed;
-      inset: 0;
-      background: #0d0d1a;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      z-index: 9999;
-      font-family: "Press Start 2P", "Courier New", monospace;
-      padding: 16px;
-      box-sizing: border-box;
-    `;
+   const efReal  = Math.round(parseFloat(document.getElementById('cierre-efectivo').value) || 0);
+   const qrReal  = Math.round(parseFloat(document.getElementById('cierre-qr').value)       || 0);
+   const tarReal = Math.round(parseFloat(document.getElementById('cierre-tarjeta').value)  || 0);
 
-    // ─── Caja modal retro ─────────────────────────────────────────
-    const modal = document.createElement('div');
-    modal.style.cssText = `
-      background: #12122a;
-      border: 4px solid #FFD700;
-      box-shadow: 0 0 0 2px #0d0d1a, 0 0 0 6px #FFD700, 8px 8px 0 #000;
-      padding: 28px 28px 24px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 20px;
-      width: 100%;
-      max-width: 320px;
-      box-sizing: border-box;
-    `;
+  // Obtener ventas del turno desde Supabase
+  let vEf = 0, vQr = 0, vTar = 0;
 
-    // Título
-    const title = document.createElement('div');
-    title.style.cssText = `
-      font-size: 16px;
-      color: #FFD700;
-      text-align: center;
-      line-height: 1.8;
-      text-shadow: 2px 2px 0 #888;
-      letter-spacing: 1px;
-    `;
-    title.innerHTML = 'GRAN PODER<br>AL ESTILO PACHA';
+  if (supabaseClient && turno.id) {
+    try {
+      const { data, error } = await supabaseClient
+        .from('ventas')
+        .select('monto_efectivo,monto_qr,monto_tarjeta')
+        .eq('turno_id', turno.id)
+        .eq('anulado', false);
 
-    // Separador pixel
-    const sep = document.createElement('div');
-    sep.style.cssText = `
-      width: 100%;
-      height: 3px;
-      background: repeating-linear-gradient(90deg, #FFD700 0px, #FFD700 6px, transparent 6px, transparent 10px);
-    `;
+      if (error) throw error;
 
-    // Label
-    const label = document.createElement('div');
-    label.style.cssText = `
-      font-size: 8px;
-      color: #aaa;
-      letter-spacing: 1px;
-      text-align: center;
-    `;
-    label.textContent = 'INGRESA TU NOMBRE';
-
-    // ─── Wrapper relativo para el dropdown ───────────────────────
-    const inputWrapper = document.createElement('div');
-    inputWrapper.style.cssText = 'position: relative; width: 100%;';
-
-    // Input  (font-size ≥ 16px evita zoom automático en iOS Safari)
-    const input = document.createElement('input');
-    input.type        = 'text';
-    input.maxLength   = 16;
-    input.placeholder = 'Tu nombre...';
-    input.autocomplete = 'off';
-    input.autocorrect  = 'off';
-    input.autocapitalize = 'characters';
-    input.spellcheck   = false;
-    input.style.cssText = `
-      font-family: "Press Start 2P", "Courier New", monospace;
-      font-size: 16px;
-      padding: 12px 10px;
-      border: 3px solid #FFD700;
-      background: #06060f;
-      color: #FFD700;
-      text-align: center;
-      outline: none;
-      width: 100%;
-      box-sizing: border-box;
-      caret-color: #FFD700;
-      letter-spacing: 2px;
-      -webkit-appearance: none;
-      border-radius: 0;
-    `;
-
-    // ─── Dropdown de autocompletado (solo nombres de ESTE dispositivo) ──
-    const dropdown = document.createElement('div');
-    dropdown.style.cssText = `
-      position: absolute;
-      top: 100%;
-      left: 0;
-      right: 0;
-      background: #06060f;
-      border: 3px solid #FFD700;
-      border-top: none;
-      z-index: 10001;
-      display: none;
-      max-height: 160px;
-      overflow-y: auto;
-      box-sizing: border-box;
-    `;
-
-    // Nombres guardados localmente en este dispositivo
-    const nombresLocales = JSON.parse(localStorage.getItem('jugador_nombres') || '[]');
-
-    const mostrarDropdown = () => {
-      const val = input.value.trim().toUpperCase();
-      dropdown.innerHTML = '';
-      const matches = val
-        ? nombresLocales.filter(n => n.toUpperCase().startsWith(val))
-        : nombresLocales;
-      if (matches.length === 0) { dropdown.style.display = 'none'; return; }
-      matches.forEach(name => {
-        const item = document.createElement('div');
-        item.textContent = name;
-        item.style.cssText = `
-          padding: 13px 14px;
-          font-family: "Press Start 2P", "Courier New", monospace;
-          font-size: 13px;
-          color: #FFD700;
-          cursor: pointer;
-          border-bottom: 1px solid #222;
-          text-align: left;
-          letter-spacing: 1px;
-        `;
-        item.addEventListener('pointerover', () => { item.style.background = '#1a1a3a'; });
-        item.addEventListener('pointerout',  () => { item.style.background = 'transparent'; });
-        item.addEventListener('pointerdown', (e) => {
-          e.preventDefault();
-          input.value = name;
-          dropdown.style.display = 'none';
-        });
-        dropdown.appendChild(item);
+      if (data) data.forEach(v => {
+        vEf  += parseFloat(v.monto_efectivo) || 0;
+        vQr  += parseFloat(v.monto_qr)       || 0;
+        vTar += parseFloat(v.monto_tarjeta)  || 0;
       });
-      dropdown.style.display = 'block';
-    };
 
-    // El input arranca siempre vacío — la sugerencia aparece al tocar
-    input.addEventListener('input',  mostrarDropdown);
-    input.addEventListener('focus',  mostrarDropdown);
-    input.addEventListener('blur',   () => setTimeout(() => { dropdown.style.display = 'none'; }, 200));
-
-    inputWrapper.appendChild(input);
-    inputWrapper.appendChild(dropdown);
-
-    // Botón
-    const btn = document.createElement('button');
-    btn.textContent = '▶  JUGAR';
-    btn.style.cssText = `
-      font-family: "Press Start 2P", "Courier New", monospace;
-      font-size: 13px;
-      padding: 14px 0;
-      width: 100%;
-      background: #FFD700;
-      color: #000;
-      border: none;
-      cursor: pointer;
-      letter-spacing: 1px;
-      box-shadow: 4px 4px 0 #a08000;
-      -webkit-appearance: none;
-      border-radius: 0;
-      transition: transform 0.07s, box-shadow 0.07s;
-    `;
-    btn.addEventListener('pointerdown', () => {
-      btn.style.transform  = 'translate(3px, 3px)';
-      btn.style.boxShadow  = '1px 1px 0 #a08000';
-    });
-    btn.addEventListener('pointerup',   () => {
-      btn.style.transform  = '';
-      btn.style.boxShadow  = '4px 4px 0 #a08000';
-    });
-
-    modal.appendChild(title);
-    modal.appendChild(sep);
-    modal.appendChild(label);
-    modal.appendChild(inputWrapper);
-    modal.appendChild(btn);
-    screen.appendChild(modal);
-    document.body.appendChild(screen);
-
-    // Enfocar después de un tick (iOS necesita el pequeño delay)
-    setTimeout(() => input.focus(), 100);
-
-    const confirmar = () => {
-      const nombre = input.value.trim() || 'Anónimo';
-      // Guardar en lista local de este dispositivo (máx 10 nombres)
-      const lista = JSON.parse(localStorage.getItem('jugador_nombres') || '[]');
-      if (!lista.includes(nombre)) { lista.unshift(nombre); }
-      localStorage.setItem('jugador_nombres', JSON.stringify(lista.slice(0, 10)));
-      this.registry.set('nombreJugador', nombre);
-      screen.remove();
-      this.scene.start('GameScene');
-    };
-
-    btn.addEventListener('click', confirmar);
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); confirmar(); }
-    });
-  }
-}
-
-const W           = 800;
-const H           = 500;
-const WORLD_W     = 8700;
-const PISO_H      = 64;           // alto del piso en pantalla
-const GROUND_Y    = H - PISO_H;   // y donde comienza el tope del piso
-const LLAMA_SCALE       = 0.09;  // escala normal (después de comer moneda)
-const LLAMA_SCALE_SMALL = 0.05;  // escala inicial (llama pequeña)
-const LLAMA_SCALE_CAPA  = 0.12;  // escala capa (después de comer flor)
-
-// Enemigo "goomba" (el personaje del traje/lentes que subiste)
-const GOOMBA_SCALE = 0.10;
-const GOOMBA_SPEED  = 70;
-
-// Banda visible de piso.png (1536×1024): contenido en cols 234-1504, filas 408-558
-const SRC_X = 234;
-const SRC_Y = 408;
-const SRC_W = 1057;   // hasta col 1291 del original, excluye la zona vacía al final
-const SRC_H = 150;
-
-// ─────────────────────────────────────────────────────
-//  PreloadScene
-// ─────────────────────────────────────────────────────
-class PreloadScene extends Phaser.Scene {
-  constructor() { super({ key: 'PreloadScene' }); }
-
-  preload() {
-    this.cameras.main.setBackgroundColor('#000000');
-    const cx = W / 2, cy = H / 2;
-    this.add.rectangle(cx, cy, 420, 8, 0x333333);
-    const bar = this.add.rectangle(cx - 200, cy, 0, 6, 0xF5E8B0).setOrigin(0, 0.5);
-    this.load.on('progress', v => { bar.width = 400 * v; });
-    // Ignorar errores de assets opcionales para no crashear
-    this.load.on('loaderror', (file) => {
-      console.warn('[preload] asset no encontrado:', file.key);
-    });
-
-    // Sprites de la llama — forma normal
-    this.load.atlas('llama', 'spritesheet.png', 'spritesheet.json');
-    this.load.atlas('jump',  'jump.png',        'jump.json');
-    this.load.atlas('idle',  'idle.png',        'idle.json');
-    // Sprites de la llama — forma CAPA (fondo transparente, no necesitan _removeBackground)
-    this.load.atlas('quietocapa',  'quietocapa.png',  'quietocapa.json');
-    this.load.atlas('caminocapa',  'caminocapa.png',  'caminocapa.json');
-    this.load.atlas('saltocapa',   'saltocapa.png',   'saltocapa.json');
-    // Power-up: flor de fuego (imagen estática)
-    this.load.image('flordefuego', 'flordefuego.png');
-    this.load.image('misil',       'misil.png');
-    this.load.image('suelooriginal', 'suelooriginal.jpg');
-    this.load.image('ladrillo', 'ladrillo.png');
-    this.load.image('nube', 'nubes.png');
-    this.load.image('tubo', 'po.png');
-
-    // Enemigo "honguito malo"
-    this.load.atlas('goomba', 'honguitomalo.png', 'honguitomalo.json');
-    // Tiles para escaleras (ya tienen fondo transparente, no se necesita procesar)
-    this.load.image('tile_block', 'tiles.png');
-    this.load.image('lava', 'lava.png');
-    this.load.image('roca', 'roca.png');
-    this.load.image('puente', 'puente.png');
-    this.load.image('aniversario', 'aniversario.png');
-    this.load.image('castillo',   'castillo.png');
-    this.load.audio('completado', 'completado.mp3');
-
-    // Elefante del puente final
-    this.load.atlas('elefante_camino', 'camino.png', 'camino.json');
-    this.load.atlas('elefante_salto',  'salto.png',  'salto.json');
-
-    // Moneda animada (sprite sheet + JSON ya con fondo transparente)
-    this.load.atlas('moneda', 'moneda.png', 'moneda.json');
-
-    // Sonidos
-    this.load.audio('sonido_salto',  'saltosonido.mp3');
-    this.load.audio('sonido_moneda', 'monedasonido.mp3');
-    // musica_fondo: intentar cargar, si falla el loaderror lo silencia
-    this.load.audio('musica_fondo',  'supermariobros.mp3');
-  }
-
-  create() { this.scene.start('NameScene'); }
-}
-
-// ─────────────────────────────────────────────────────
-//  TitleScene  — pantalla de título con aniversario.png
-// ─────────────────────────────────────────────────────
-class TitleScene extends Phaser.Scene {
-  constructor() { super({ key: 'TitleScene' }); }
-
-  create() {
-    // No borrar el canvas antes de renderizar → el mundo de GameScene queda visible
-    this.cameras.main.clearBeforeRender = false;
-    this.cameras.main.setBackgroundColor('rgba(0,0,0,0)');
-
-    // Imagen centrada como logo/cartel — no ocupa toda la pantalla
-    const imgW = Math.round(W * 0.56);
-    const imgH = Math.round(imgW * (1024 / 1536));       // mantiene proporción 3:2
-    this.add.image(W / 2, H / 2 - 22, 'aniversario')
-      .setDisplaySize(imgW, imgH);
-
-    // Franja oscura debajo de la imagen para las opciones
-    this.add.rectangle(W / 2, H - 52, W, 80, 0x000000, 0.70);
-
-    const PF = '"Press Start 2P", "Courier New", monospace';
-
-    const opt1 = this.add.text(W / 2, H - 74,
-      'GÁNATE UNA MESA TRIVIA',
-      { fontFamily: PF, fontSize: '10px', color: '#ffffff', stroke: '#000', strokeThickness: 3 }
-    ).setOrigin(0.5).setInteractive({ useHandCursor: true });
-
-    const opt2 = this.add.text(W / 2, H - 44,
-      'JUGAR DEMO',
-      { fontFamily: PF, fontSize: '13px', color: '#FFD700', stroke: '#000', strokeThickness: 3 }
-    ).setOrigin(0.5).setInteractive({ useHandCursor: true });
-
-    // Cursor parpadeante junto a opt2
-    const arrow = this.add.text(opt2.x - opt2.width / 2 - 18, H - 44, '▶',
-      { fontFamily: PF, fontSize: '12px', color: '#FFD700' }
-    ).setOrigin(0.5);
-    this.tweens.add({ targets: arrow, alpha: 0, duration: 380, yoyo: true, repeat: -1 });
-
-    // Hover en opt1
-    opt1.on('pointerover',  () => opt1.setColor('#FFD700'));
-    opt1.on('pointerout',   () => opt1.setColor('#ffffff'));
-
-    const start = () => {
-      this.input.keyboard.removeAllListeners();
-      this.scene.stop('TitleScene'); // GameScene ya corre de fondo
-    };
-    opt1.on('pointerdown', start);
-    opt2.on('pointerdown', start);
-    this.input.keyboard.on('keydown', start);
-  }
-}
-
-// ─────────────────────────────────────────────────────
-//  GameScene
-// ─────────────────────────────────────────────────────
-class GameScene extends Phaser.Scene {
-  constructor() { super({ key: 'GameScene' }); }
-
-  // Elimina el fondo de color de un atlas usando "flood fill" desde los
-  // bordes de la imagen: solo se vuelve transparente el fondo que está
-  // REALMENTE conectado al borde. Así no se borran partes del propio
-  // personaje que compartan el mismo color (p. ej. un traje negro sobre
-  // fondo negro), porque quedan encerradas por otros colores (piel, etc.)
-  // y nunca se conectan con el borde de la imagen.
-  _removeBackground(key) {
-    // Si ya fue procesada (es canvas texture), no volver a correr el flood-fill.
-    // En un restart de escena las texturas persisten en el TextureManager global,
-    // y una segunda pasada haría transparentes los bordes negros del sprite.
-    const existing = this.textures.get(key);
-    if (existing && existing.source && existing.source[0] && existing.source[0].isCanvas) return;
-    const atlas = this.textures.get(key);
-    const src   = atlas.getSourceImage();
-    const oc    = document.createElement('canvas');
-    const W = oc.width  = src.width;
-    const H = oc.height = src.height;
-    const ctx   = oc.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(src, 0, 0);
-
-    const id = ctx.getImageData(0, 0, W, H);
-    const d  = id.data;
-    const tol = 40;
-
-    // Color de fondo: NO se puede asumir que sea el píxel (0,0) del lienzo
-    // completo (puede ser una esquina vacía/transparente rara). En cambio,
-    // muestreamos una esquina de cada frame real y usamos el color que más
-    // se repite — ese es el relleno de fondo real usado en todo el atlas.
-    const frameEntries = Object.entries(atlas.frames).filter(([n]) => n !== '__BASE');
-    const sameColor = (a, b) =>
-      Math.abs(a[0]-b[0]) < tol && Math.abs(a[1]-b[1]) < tol && Math.abs(a[2]-b[2]) < tol;
-    const samples = (frameEntries.length ? frameEntries : [[null, { cutX: 1, cutY: 1 }]])
-      .map(([, f]) => ctx.getImageData(
-        Math.min((f.cutX ?? 0) + 2, W - 1),
-        Math.min((f.cutY ?? 0) + 2, H - 1),
-        1, 1
-      ).data);
-    let best = samples[0], bestCount = 0;
-    for (const s of samples) {
-      const c = samples.filter(o => sameColor(s, o)).length;
-      if (c > bestCount) { best = s; bestCount = c; }
+    } catch(e) {
+      console.warn('Error consultando ventas:', e);
     }
-    const [bgR, bgG, bgB] = best;
-    // Un píxel cuenta como "fondo" si ya es transparente (alpha 0 — típico
-    // en el borde exterior de la imagen) o si su color se parece al color
-    // de fondo muestreado. Incluir los ya-transparentes es clave: si no,
-    // el flood fill nunca puede "entrar" desde ese borde y el fondo entero
-    // se queda opaco (se ve como un recuadro sólido alrededor del sprite).
-    const isBg = (i) =>
-      d[i + 3] === 0 ||
-      (Math.abs(d[i] - bgR) < tol && Math.abs(d[i + 1] - bgG) < tol && Math.abs(d[i + 2] - bgB) < tol);
+  }
 
-    const visited = new Uint8Array(W * H);
-    const stack = [];
-    const pushIfBg = (x, y) => {
-      if (x < 0 || x >= W || y < 0 || y >= H) return;
-      const p = y * W + x;
-      if (visited[p]) return;
-      if (!isBg(p * 4)) return;
-      visited[p] = 1;
-      stack.push(p);
-    };
+   const apertura = Math.round(parseFloat(turno.monto_apertura) || 0);
+   vEf = Math.round(vEf);
+   vQr = Math.round(vQr);
+   vTar = Math.round(vTar);
+  const efEsp = apertura + vEf; // fondo inicial + ventas efectivo
 
-    for (let x = 0; x < W; x++) { pushIfBg(x, 0); pushIfBg(x, H - 1); }
-    for (let y = 0; y < H; y++) { pushIfBg(0, y); pushIfBg(W - 1, y); }
+  const difEf  = efReal  - efEsp;
+  const difQr  = qrReal  - vQr;
+  const difTar = tarReal - vTar;
 
-    while (stack.length) {
-      const p = stack.pop();
-      const x = p % W, y = (p / W) | 0;
-      d[p * 4 + 3] = 0; // transparente
-      pushIfBg(x + 1, y);
-      pushIfBg(x - 1, y);
-      pushIfBg(x, y + 1);
-      pushIfBg(x, y - 1);
+  function fmtDif(d) {
+     if (Math.abs(d) < 1) return { txt: '✓ Cuadra', cls: 'ok' };
+     if (d > 0) return { txt: `+Bs ${fmt(d)} (sobra)`, cls: 'sobra' };
+     return { txt: `-Bs ${fmt(Math.abs(d))} (falta)`, cls: 'falta' };
+  }
+  function setEl(id, txt, cls) {
+    const el = document.getElementById(id);
+    el.textContent = txt; el.className = 'val ' + (cls || '');
+  }
+
+   setEl('cr-ef-esp',  `Bs ${fmt(efEsp)}`);
+   setEl('cr-ef-real', `Bs ${fmt(efReal)}`);
+  const de = fmtDif(difEf);  setEl('cr-ef-dif',  de.txt, de.cls);
+
+   setEl('cr-qr-esp',  `Bs ${fmt(vQr)}`);
+   setEl('cr-qr-real', `Bs ${fmt(qrReal)}`);
+  const dq = fmtDif(difQr);  setEl('cr-qr-dif',  dq.txt, dq.cls);
+
+   setEl('cr-tar-esp',  `Bs ${fmt(vTar)}`);
+   setEl('cr-tar-real', `Bs ${fmt(tarReal)}`);
+  const dt = fmtDif(difTar); setEl('cr-tar-dif',  dt.txt, dt.cls);
+
+   const todoCuadra = Math.abs(difEf) < 1 && Math.abs(difQr) < 1 && Math.abs(difTar) < 1;
+  setEl('cr-estado', todoCuadra ? '✅ Cuadre perfecto' : '⚠️ Hay diferencias', todoCuadra ? 'ok' : 'falta');
+
+  // Guardar los valores calculados para el confirm
+  document.getElementById('caja-btn-calcular').dataset.efEsp  = efEsp;
+  document.getElementById('caja-btn-calcular').dataset.vQr    = vQr;
+  document.getElementById('caja-btn-calcular').dataset.vTar   = vTar;
+  document.getElementById('caja-btn-calcular').dataset.difEf  = difEf;
+  document.getElementById('caja-btn-calcular').dataset.difQr  = difQr;
+  document.getElementById('caja-btn-calcular').dataset.difTar = difTar;
+
+  document.getElementById('caja-result-grid').style.display = 'flex';
+  document.getElementById('caja-btn-calcular').style.display = 'none';
+  document.getElementById('caja-btn-confirmar-cierre').style.display = 'block';
+});
+
+document.getElementById('caja-btn-confirmar-cierre').addEventListener('click', async () => {
+  const s = getCurrentSession();
+  const turno = getTurno();
+  if (!s || !turno) return;
+
+  const btn = document.getElementById('caja-btn-calcular');
+  const confirmBtn = document.getElementById('caja-btn-confirmar-cierre');
+  if (confirmBtn.disabled) return;
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = 'GUARDANDO CIERRE…';
+  const efReal  = parseFloat(document.getElementById('cierre-efectivo').value) || 0;
+  const qrReal  = parseFloat(document.getElementById('cierre-qr').value)       || 0;
+  const tarReal = parseFloat(document.getElementById('cierre-tarjeta').value)  || 0;
+
+  const cierreData = {
+     monto_cierre_efectivo: Math.round(efReal),
+     monto_cierre_qr:       Math.round(qrReal),
+     monto_cierre_tarjeta:  Math.round(tarReal),
+    ventas_efectivo:  parseFloat(btn.dataset.efEsp) - (parseFloat(turno.monto_apertura) || 0),
+    ventas_qr:        parseFloat(btn.dataset.vQr),
+    ventas_tarjeta:   parseFloat(btn.dataset.vTar),
+    diferencia_efectivo: parseFloat(btn.dataset.difEf),
+    diferencia_qr:       parseFloat(btn.dataset.difQr),
+    diferencia_tarjeta:  parseFloat(btn.dataset.difTar),
+    estado: 'cerrada',
+    cerrada_en: new Date().toISOString(),
+  };
+
+  try {
+    if (!supabaseClient || !turno.id) {
+      throw new Error('No se encontró el turno en Supabase');
     }
 
-    ctx.putImageData(id, 0, 0);
+    const { data: cierreGuardado, error } = await supabaseClient.rpc(
+      'cerrar_turno_caja',
+      {
+        p_turno_id: turno.id,
 
-    const frames = {};
-    frameEntries.forEach(([name, frame]) => {
-      frames[name] = {
-        x: frame.cutX ?? 0, y: frame.cutY ?? 0,
-        w: frame.cutWidth ?? W, h: frame.cutHeight ?? H,
-      };
-    });
-    this.textures.remove(key);
-    const newTex = this.textures.addCanvas(key, oc);
-    Object.entries(frames).forEach(([name, f]) => newTex.add(name, 0, f.x, f.y, f.w, f.h));
-  }
+        p_monto_cierre_efectivo:
+          cierreData.monto_cierre_efectivo,
 
-  // Dibuja un bloque (cuadro amarillo con marco café) con un corazón en
-  // el centro mientras no se usó. `activo=true` → corazón rojo visible.
-  // `activo=false` → bloque café plano y fijo (ya usado, sin corazón).
-  _crearTexturaBloque(key, activo) {
-    const S = 64;
-    const oc  = document.createElement('canvas');
-    oc.width  = S;
-    oc.height = S;
-    const ctx = oc.getContext('2d');
+        p_monto_cierre_qr:
+          cierreData.monto_cierre_qr,
 
-    const bg    = activo ? '#FFD447' : '#6B4423';
-    const borde = activo ? '#6B4423' : '#4A2E15';
+        p_monto_cierre_tarjeta:
+          cierreData.monto_cierre_tarjeta,
 
-    // Relleno
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, S, S);
+        p_ventas_efectivo:
+          cierreData.ventas_efectivo,
 
-    // Borde grueso
-    ctx.strokeStyle = borde;
-    ctx.lineWidth = 6;
-    ctx.strokeRect(3, 3, S - 6, S - 6);
+        p_ventas_qr:
+          cierreData.ventas_qr,
 
-    // Remaches en las esquinas
-    ctx.fillStyle = borde;
-    const r = 6;
-    [[10,10],[S-10,10],[10,S-10],[S-10,S-10]].forEach(([cx, cy]) => {
-      ctx.fillRect(cx - r/2, cy - r/2, r, r);
-    });
+        p_ventas_tarjeta:
+          cierreData.ventas_tarjeta,
 
-    // "?" estilo Super Mario en el centro (solo bloque activo)
-    if (activo) {
-      ctx.fillStyle = '#FFFFFF';
-      ctx.strokeStyle = '#6B4423';
-      ctx.lineWidth = 2;
-      ctx.font = 'bold 36px Arial';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.strokeText('?', S / 2, S / 2 + 2);
-      ctx.fillText('?', S / 2, S / 2 + 2);
-    }
+        p_diferencia_efectivo:
+          cierreData.diferencia_efectivo,
 
-    if (this.textures.exists(key)) this.textures.remove(key);
-    this.textures.addCanvas(key, oc);
-  }
+        p_diferencia_qr:
+          cierreData.diferencia_qr,
 
-  create() {
-    // Al cerrar/reiniciar la escena, destruir todos los colliders ANTES de que
-    // Phaser destruya los grupos — evita "Cannot read properties of undefined (reading 'size')"
-    this.events.once('shutdown', () => {
-      try { this.physics.world.colliders.destroy(); } catch(e) {}
-      try { this.physics.world.pause(); } catch(e) {}
-    });
-
-    // Resetear flags de estado al inicio (importante en reinicio de escena)
-    this._dying      = false;
-    this._titleActive = false;
-
-    // Limpiar animaciones previas (si la escena se reinició) para evitar
-    // que apunten a texturas viejas borradas por _removeBackground.
-    ['caminar', 'saltar', 'goomba_caminar',
-     'elefante_caminar', 'elefante_saltar',
-     'caminar_capa', 'saltar_capa'].forEach(k => {
-      if (this.anims.exists(k)) this.anims.remove(k);
-    });
-
-    // Quitar fondo de los sprites de la llama
-    this._removeBackground('llama');
-    this._removeBackground('jump');
-    this._removeBackground('idle');
-
-
-
-    // Sonidos: música de fondo en loop + efectos
-    // Cada uno se guarda como null si el asset no cargó; los .play() ya tienen guard
-    this.sonidoSalto  = this.cache.audio.exists('sonido_salto')  ? this.sound.add('sonido_salto',  { volume: 0.6 })          : null;
-    this.sonidoMoneda = this.cache.audio.exists('sonido_moneda') ? this.sound.add('sonido_moneda', { volume: 0.8 })          : null;
-    this.musicaFondo  = this.cache.audio.exists('musica_fondo')  ? this.sound.add('musica_fondo',  { loop: true, volume: 0.4 }) : null;
-
-    const tryPlayMusic = () => {
-      // Reanudar el AudioContext directamente (necesario en Safari iOS)
-      const ctx = this.sound.context;
-      if (ctx && ctx.state === 'suspended') {
-        ctx.resume().then(() => {
-          if (this.musicaFondo && !this.musicaFondo.isPlaying) this.musicaFondo.play();
-        });
-      } else {
-        if (this.musicaFondo && !this.musicaFondo.isPlaying) this.musicaFondo.play();
+        p_diferencia_tarjeta:
+          cierreData.diferencia_tarjeta
       }
-    };
+    );
 
-    if (this.sound.locked) {
-      // Phaser detecta bloqueo — escuchamos su evento Y también el primer toque
-      this.sound.once('unlocked', tryPlayMusic);
+    if (error) throw error;
+
+    if (!cierreGuardado) {
+      throw new Error('Supabase no confirmó el cierre');
+    }
+
+  } catch (e) {
+    console.error('Error cerrando turno:', e);
+
+    showToast(
+      `⚠️ No se pudo confirmar el cierre: ${e.message || 'error de conexión'}`,
+      4500,
+      'warning'
+    );
+
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = 'CONFIRMAR CIERRE';
+    return;
+  }
+  // Imprimir recibo de cierre
+  const s2 = getCurrentSession();
+  const apertura2 = parseFloat(turno.monto_apertura) || 0;
+  const vEf2 = parseFloat(btn.dataset.efEsp) - apertura2;
+  const vQr2 = parseFloat(btn.dataset.vQr);
+  const vTar2 = parseFloat(btn.dataset.vTar);
+  const totalVentas = vEf2 + vQr2 + vTar2;
+  const difEf2  = parseFloat(btn.dataset.difEf);
+  const difQr2  = parseFloat(btn.dataset.difQr);
+  const difTar2 = parseFloat(btn.dataset.difTar);
+  const todoCuadra2 = Math.abs(difEf2) < 0.01 && Math.abs(difQr2) < 0.01 && Math.abs(difTar2) < 0.01;
+  const ahora = new Date();
+  const fmtFecha = dt => dt ? new Date(dt).toLocaleString('es-BO', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+
+  // El cierre conserva su formato actual; el transporte físico se realiza
+  // mediante WebUSB + ESC/POS, igual que las comandas.
+  const fmtDif = d => d > 0
+    ? `SOBRA Bs ${Math.abs(d).toFixed(2)}`
+    : `FALTA Bs ${Math.abs(d).toFixed(2)}`;
+  const difLine = d => Math.abs(d) < 0.01
+    ? ''
+    : `<div class="pc-dif"><span>DIFERENCIA</span><span>${fmtDif(d)}</span></div>`;
+
+  const oldPA = document.getElementById('print-area');
+  if (oldPA) oldPA.remove();
+  const oldST = document.getElementById('print-style-tag');
+  if (oldST) oldST.remove();
+
+  const cierreStyle = document.createElement('style');
+  cierreStyle.id = 'print-style-tag';
+  cierreStyle.textContent = `
+    @media print {
+      @page { size: A4 portrait; margin: 0; }
+      html  { height: auto !important; width: 210mm !important; }
+      body  {
+        height: auto !important; min-height: 0 !important;
+        overflow: visible !important; background: #fff !important;
+        margin: 0 !important; padding: 0 !important;
+        width: 210mm !important;
+      }
+      body::before { display: none !important; }
+      body::after  { display: none !important; }
+      body > * { display: none !important; }
+      #print-area {
+        display: block !important;
+        width: 180mm !important;
+        font-family: Arial, Helvetica, sans-serif;
+        font-weight: 700;
+        color: #000;
+        background: #fff;
+        margin: 12mm auto; padding: 0 8mm 12mm;
+        box-sizing: border-box;
+        text-transform: uppercase;
+      }
+      #print-area .pc-brand {
+        text-align: center; font-size: 18pt; font-weight: 900;
+        letter-spacing: .04em; margin-bottom: 2pt; padding-top: 2pt;
+      }
+      #print-area .pc-titulo {
+        text-align: center; font-size: 11pt; font-weight: 900;
+        border-top: 2.5px solid #000; border-bottom: 2.5px solid #000;
+        padding: 3pt 0; margin-bottom: 4pt;
+      }
+      #print-area .pc-info {
+        font-size: 10pt; font-weight: 900; margin: 2pt 0;
+      }
+      #print-area .pc-ticket-meta {
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: 2mm; width: 100%; margin: 2pt 0 4pt;
+        font-size: 8pt; font-weight: 900; line-height: 1.1;
+      }
+      #print-area .pc-ticket-meta .pc-datetime {
+        font-size: 8pt; font-weight: 700; white-space: nowrap;
+        text-align: right;
+      }
+      #print-area .pc-divider {
+        border: none; border-top: 1.5px dashed #000; margin: 4pt 0;
+      }
+      #print-area .pc-metodo {
+        font-size: 11pt; font-weight: 900;
+        border-bottom: 1px solid #ddd; padding: 3pt 0 2pt;
+        margin-bottom: 1pt;
+      }
+      #print-area .pc-row {
+        display: grid; grid-template-columns: minmax(0, 1fr) max-content;
+        column-gap: 2mm; align-items: baseline;
+        font-size: 11pt; font-weight: 700;
+        padding: 1pt 0; width: 100%; min-width: 0;
+      }
+      #print-area .pc-row .pc-lbl {
+        color: #000; min-width: 0; overflow-wrap: anywhere;
+      }
+      #print-area .pc-row .pc-val {
+        font-weight: 900; white-space: nowrap; text-align: right;
+      }
+      #print-area .pc-dif {
+        display: grid; grid-template-columns: minmax(0, 1fr) max-content;
+        column-gap: 2mm; align-items: baseline;
+        font-size: 11pt; font-weight: 700; padding: 2pt 0 4pt;
+        width: 100%; min-width: 0;
+      }
+      #print-area .pc-dif > span:first-child {
+        min-width: 0; overflow-wrap: anywhere;
+      }
+      #print-area .pc-dif > span:last-child {
+        white-space: nowrap; text-align: right;
+      }
+      #print-area .pc-total-bloque {
+        border-top: 2.5px solid #000; border-bottom: 2.5px solid #000;
+        padding: 4pt 0; margin: 6pt 0;
+      }
+      #print-area .pc-total-row {
+        display: grid; grid-template-columns: minmax(0, 1fr) max-content;
+        column-gap: 2mm; align-items: baseline;
+        font-size: 12pt; font-weight: 700; min-width: 0;
+      }
+      #print-area .pc-total-row > span:first-child {
+        min-width: 0; overflow-wrap: anywhere;
+      }
+      #print-area .pc-total-row > span:last-child {
+        white-space: nowrap; text-align: right;
+      }
+      #print-area .pc-estado {
+        text-align: center; font-size: 13pt; font-weight: 900;
+        border: 2.5px solid #000; padding: 5pt 0; margin-top: 4pt;
+      }
+    }
+  `;
+  document.head.appendChild(cierreStyle);
+
+  const pa = document.createElement('div');
+  pa.id = 'print-area';
+  pa.dataset.printFormat = 'a4';
+  pa.style.display = 'none';
+  const totEsp = (parseFloat(btn.dataset.efEsp)||0) + vQr2 + vTar2;
+  const totCont = efReal + qrReal + tarReal;
+  pa.innerHTML = `
+    <div class="pc-brand">MAMA ORURO</div>
+    <div class="pc-titulo">CIERRE DE CAJA</div>
+    <div class="pc-ticket-meta">
+      <span>CAJA: ${formatReceiptCaja(s2?.caja || turno?.caja)}</span>
+      <span class="pc-datetime">${formatReceiptDateTime(ahora)}</span>
+    </div>
+    <hr class="pc-divider">
+     <div class="pc-metodo">EFECTIVO</div>
+     <div class="pc-row"><span class="pc-lbl">ESPERADO</span><span class="pc-val">Bs ${fmt(parseFloat(btn.dataset.efEsp)||0)}</span></div>
+     <div class="pc-row"><span class="pc-lbl">CONTADO</span><span class="pc-val">Bs ${fmt(efReal)}</span></div>
+    ${difLine(difEf2)}
+    <hr class="pc-section-divider">
+     <div class="pc-metodo">QR</div>
+     <div class="pc-row"><span class="pc-lbl">ESPERADO</span><span class="pc-val">Bs ${fmt(vQr2)}</span></div>
+     <div class="pc-row"><span class="pc-lbl">CONTADO</span><span class="pc-val">Bs ${fmt(qrReal)}</span></div>
+    ${difLine(difQr2)}
+    <hr class="pc-section-divider">
+     <div class="pc-metodo">TARJETA</div>
+     <div class="pc-row"><span class="pc-lbl">ESPERADO</span><span class="pc-val">Bs ${fmt(vTar2)}</span></div>
+     <div class="pc-row"><span class="pc-lbl">CONTADO</span><span class="pc-val">Bs ${fmt(tarReal)}</span></div>
+    ${difLine(difTar2)}
+    <hr class="pc-divider">
+    <div class="pc-total-bloque">
+       <div class="pc-total-row"><span>TOTAL ESPERADO</span><span>Bs ${fmt(totEsp)}</span></div>
+       <div class="pc-total-row" style="margin-top:2pt;"><span>TOTAL CONTADO</span><span>Bs ${fmt(totCont)}</span></div>
+    </div>
+  `;
+  document.body.appendChild(pa);
+
+   imprimirTicketCuandoEsteListo().catch(error => {
+     console.warn('No se pudo imprimir el cierre:', error);
+     showToast('El cierre se guardó, pero la impresión falló', 3500);
+   });
+
+  clearTurno();
+  updateDockCajaLabel();
+  showToast('🔒 Caja cerrada correctamente', 3000);
+  confirmBtn.disabled = false;
+  confirmBtn.textContent = 'CONFIRMAR CIERRE';
+  const _s3 = getCurrentSession();
+  if (_s3) { cajaShowStep('caja-step1'); await renderOverviewCajas(_s3); }
+  else document.getElementById('caja-modal').classList.remove('open');
+});
+function abrirInventarios() {
+  document.getElementById('inventarios-modal').classList.add('open');
+  loadInventarios('hoy');
+}
+function abrirReportes() {
+  if (!esCaja1()) {
+    showToast('🔒 No estás autorizado para ver reportes', 3500, 'warning');
+    return;
+  }
+  repResetUI();
+  document.getElementById('reportes-modal').classList.add('open');
+  loadReportes();
+}
+
+function renderDock() {
+  const dockEl = document.getElementById('dock');
+  dockEl.innerHTML = '';
+  dockApps.forEach((app, i) => {
+    const slot = document.createElement('div');
+    slot.className = 'dock-slot' + (selectedIdx === i ? ' selected' : '');
+    slot.dataset.i = i;
+    slot.innerHTML = `
+      <div class="dock-icon">
+        <img src="${app.icon}" alt="${app.name}" onerror="this.style.display='none'">
+      </div>
+      <div class="dock-label">${app.name}</div>
+      <div class="edit-btn" data-i="${i}">✏</div>`;
+    slot.addEventListener('click', e => {
+      if (e.target.closest('.edit-btn')) return;
+      if (app.url && app.url.startsWith('javascript:')) {
+        selectedIdx = i; renderDock();
+        eval(app.url.replace('javascript:', ''));
+      } else if (selectedIdx === i) {
+        if (app.url && app.url !== '#') window.open(app.url, '_blank');
+      } else { selectedIdx = i; renderDock(); }
+    });
+    slot.querySelector('.edit-btn').addEventListener('click', e => { e.stopPropagation(); openEdit(i); });
+    dockEl.appendChild(slot);
+  });
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#dock-wrap')) {
+    if (selectedIdx !== null) { selectedIdx = null; renderDock(); }
+  }
+});
+
+function openEdit(i) {
+  editIdx = i;
+  const app = dockApps[i];
+  document.getElementById('ep-name').value = app.name;
+  document.getElementById('ep-icon').value = app.icon;
+  document.getElementById('ep-url').value  = app.url;
+  document.getElementById('edit-modal').classList.add('open');
+}
+document.getElementById('ep-cancel').addEventListener('click', () => {
+  document.getElementById('edit-modal').classList.remove('open');
+});
+document.getElementById('ep-save').addEventListener('click', () => {
+  dockApps[editIdx] = {
+    name: document.getElementById('ep-name').value,
+    icon: document.getElementById('ep-icon').value,
+    url:  document.getElementById('ep-url').value,
+  };
+  saveDock(dockApps);
+  document.getElementById('edit-modal').classList.remove('open');
+  renderDock();
+});
+
+let PRODUCTS = [];
+let cart = [];
+let searchQ = '';
+
+async function loadProductsFromSupabase() {
+  try {
+    if (!supabaseClient) { renderProducts(); return; }
+    const { data, error } = await supabaseClient
+      .from('MAMAPOTOSI').select('*').order('nombre', { ascending: true });
+    if (error) { console.error("Error fetching products:", error); return; }
+    if (data && data.length > 0) {
+      PRODUCTS = data.map(item => ({
+        id: item.id, name: item.nombre, emoji: '', image: item.imagen, price: item.precio
+      }));
+      renderProducts();
+    }
+  } catch (err) { console.error("Failed to load products:", err); }
+}
+loadProductsFromSupabase();
+
+function renderProducts() {
+  const q = searchQ.toLowerCase().trim();
+  const words = q ? q.split(/\s+/).filter(Boolean) : [];
+  const list = !words.length ? PRODUCTS : PRODUCTS.filter(p => {
+    const name = p.name.toLowerCase();
+    return words.some(w => name.includes(w));
+  });
+  const grid = document.getElementById('product-grid');
+  grid.innerHTML = '';
+  if (!list.length) {
+    grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-dim);font-size:13px">
+      Sin resultados para "<b style="color:var(--text-secondary)">${searchQ}</b>"</div>`;
+    return;
+  }
+  list.forEach(p => {
+    const card = document.createElement('div');
+    card.className = 'prod-card';
+    const imgHtml = p.image
+      ? `<img class="prod-img" src="${p.image}" alt="${p.name}" loading="lazy">`
+      : `<div class="prod-emoji">${p.emoji || '📦'}</div>`;
+    card.innerHTML = `
+      ${imgHtml}
+      <div class="prod-name">${p.name}</div>
+      <div class="prod-price">Bs ${p.price}</div>`;
+    card.addEventListener('click', () => addToCart(p));
+    grid.appendChild(card);
+  });
+}
+
+function cajaEstaAbierta() {
+  const turno = getTurno();
+  const s = getCurrentSession();
+  return !!(turno && s && turno.cajero === s.usuario && turno.estado === 'abierta');
+}
+
+function addToCart(p) {
+  if (!cajaEstaAbierta()) {
+    showToast('🔒 Abre la caja primero para agregar productos', 3500);
+    return;
+  }
+  const ex = cart.find(i => i.id === p.id);
+  if (ex) ex.qty++; else cart.push({...p, qty:1});
+  showToast(`${p.emoji || '📦'} ${p.name} agregado`);
+  renderCart();
+  // Limpiar buscador para buscar el siguiente producto de inmediato
+  const _se = document.getElementById('search');
+  const _cb = document.getElementById('search-clear');
+  if (_se) {
+    _se.value = '';
+    searchQ = '';
+    if (_cb) _cb.style.display = 'none';
+    renderProducts();
+  }
+}
+function removeFromCart(id) { cart = cart.filter(i => i.id !== id); renderCart(); }
+function changeQty(id, d) {
+  const it = cart.find(i => i.id === id);
+  if (!it) return;
+  it.qty += d;
+  if (it.qty <= 0) cart = cart.filter(i => i.id !== id);
+  renderCart();
+}
+function clearCart() { cart = []; renderCart(); }
+
+function renderCart() {
+  const totalQty = cart.reduce((s,i) => s+i.qty, 0);
+
+  const {
+    subtotal: sub,
+    descuentoMonto,
+    total
+  } = getSaleTotals();
+  document.getElementById('order-count').textContent = totalQty;
+  document.getElementById('items-ct').textContent = totalQty;
+  document.getElementById('total-val').textContent = `Bs ${fmt(total)}`;
+  const discountResult =
+    document.getElementById('order-discount-result');
+
+  if (discountResult) {
+    if (descuentoMonto > 0) {
+      discountResult.textContent =
+        `Descuento - Bs ${fmt(descuentoMonto)}`;
     } else {
-      tryPlayMusic();
+      discountResult.textContent = '';
     }
+  }
+  document.getElementById('btn-checkout').disabled = cart.length === 0;
 
-    // Safari a veces ignora 'unlocked': forzamos al primer toque del usuario.
-    // Usamos document (capture) para que stopPropagation en los botones no lo bloquee.
-    this.input.once('pointerdown', tryPlayMusic);
-    this.input.keyboard.once('keydown', tryPlayMusic);
-    document.addEventListener('touchstart', tryPlayMusic, { once: true, passive: true, capture: true });
-    document.addEventListener('mousedown',  tryPlayMusic, { once: true, passive: true, capture: true });
+  const list = document.getElementById('order-list');
+  [...list.querySelectorAll('.order-item')].forEach(el => el.remove());
+  const empty = document.getElementById('order-empty');
+  if (!cart.length) { empty.style.display = 'flex'; return; }
+  empty.style.display = 'none';
 
-    // Límites del mundo y cámara (abajo extendido para que la llama pueda caer)
-    this.physics.world.setBounds(0, 0, WORLD_W, H + 600);
-    this.cameras.main.setBounds(0, 0, WORLD_W, H);
-    this.cameras.main.setBackgroundColor('#5C94FC');
+  cart.forEach(it => {
+    const el = document.createElement('div');
+    el.className = 'order-item';
+    el.innerHTML = `
+      <div class="oi-em">${it.image ? `<img src="${it.image}" alt="${it.name}" loading="lazy">` : (it.emoji || '📦')}</div>
+      <div class="oi-info">
+        <div class="oi-name">${it.name}</div>
+        <div class="oi-price-row">
+          <div class="oi-unit">Bs ${fmt(it.price)} c/u</div>
+          <div class="oi-tot">Bs ${fmt(it.price*it.qty)}</div>
+        </div>
+      </div>
+      <div class="oi-ctrl">
+        <button type="button" class="qty-btn rm" data-id="${it.id}" data-a="rm" title="Eliminar" aria-label="Eliminar ${it.name}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></button>
+        <button type="button" class="qty-btn" data-id="${it.id}" data-a="dec" aria-label="Disminuir cantidad">−</button>
+        <div class="oi-qty" aria-live="polite">${it.qty}</div>
+        <button type="button" class="qty-btn" data-id="${it.id}" data-a="inc" aria-label="Aumentar cantidad">+</button>
+      </div>`;
+    list.insertBefore(el, empty);
+  });
+}
 
-    // ── PISO VISUAL + FÍSICA (segmentado, con huecos = muerte) ──
-    // suelooriginal.jpg es 285×268 → se escala al alto del piso (PISO_H) y se tilea
-    const tileScaleY = PISO_H / 268;
-    const tileScaleX = tileScaleY;
+document.getElementById('order-list').addEventListener('click', e => {
+  const b = e.target.closest('.qty-btn');
+  if (!b) return;
+  const id = parseInt(b.dataset.id), a = b.dataset.a;
+  if (a==='inc') changeQty(id,1);
+  if (a==='dec') changeQty(id,-1);
+  if (a==='rm')  removeFromCart(id);
+});
+document.getElementById('order-clear').addEventListener('click', clearCart);
 
-    // Segmentos del piso. Los huecos son trampas mortales.
-    const floorSegs = [
-      [0,       2500],   // inicio → zona de 4 tubos + camino libre (largo)
-      // hueco de 220px: saltable como Mario
-      [2720,    3150],   // sección 2: 3 ladrillos bajos + 9 flotantes sobre el hueco 2
-      // gap 2: 3150-3400
-      [3400,    4700],   // sección 3: 5M + 1L + 2M + 3 aislados + 1 arriba
-      [4800,    6392],   // sección 4a: hasta el hueco central de la pirámide
-      [6464,    7860],   // sección 4b: termina al pie del último tile (col 8 de la escalera final)
-    ];
-    // Guardamos los segmentos para usarlos en update() (detección de borde)
-    this._floorSegs = floorSegs;
+let discountType = 'bs';
+let discountValue = 0;
+let selectedPaymentMethod = null;
+let pendingVentaTimestamp = null;
+let pendingSavedVenta = null;
 
-    this.floorBodies = [];
-    floorSegs.forEach(([x1, x2]) => {
-      const segW   = x2 - x1;
-      const centerX = x1 + segW / 2;
-      const centerY = H - PISO_H / 2;
-      // Respaldo marrón
-      this.add.rectangle(centerX, centerY, segW, PISO_H, 0x9B5E1A);
-      // Textura de piso (en espacio mundo, se mueve con cámara)
-      this.add.tileSprite(centerX, centerY, segW, PISO_H, 'suelooriginal')
-        .setTileScale(tileScaleX, tileScaleY);
-      // Cuerpo físico estático
-      const rect = this.add.rectangle(centerX, centerY, segW, PISO_H, 0, 0);
-      this.physics.add.existing(rect, true);
-      this.floorBodies.push(rect);
-    });
+function getSaleTotals() {
+  const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
 
-    // ── NUBES (decoración con parallax) ───────────────────────
-    // scrollFactor < 1 → se mueven más lento que la cámara (profundidad)
-    const cloudDefs = [
-      // [x, y, escala, scrollFactor]
-      [ 300,  55, 0.18, 0.25],
-      [ 780,  90, 0.14, 0.30],
-      [1100,  40, 0.20, 0.22],
-      [1500,  70, 0.15, 0.28],
-      [1850,  50, 0.17, 0.25],
-      [2200,  85, 0.13, 0.32],
-      [2550,  45, 0.19, 0.20],
-      [2900,  75, 0.16, 0.27],
-      [3200,  55, 0.18, 0.24],
-      [3600,  40, 0.14, 0.30],
-      [3900,  80, 0.20, 0.22],
-      [4250,  60, 0.15, 0.28],
-      [4600,  45, 0.17, 0.25],
-      [4900,  90, 0.13, 0.32],
-      [5200,  55, 0.19, 0.20],
-      [5500,  70, 0.16, 0.27],
-      [5850,  40, 0.18, 0.24],
-      [6100,  65, 0.15, 0.29],
-    ];
-    cloudDefs.forEach(([cx, cy, sc, sf]) => {
-      this.add.image(cx, cy, 'nube')
-        .setScale(sc)
-        .setScrollFactor(sf)
-        .setDepth(-1);   // detrás de todo
-    });
+  let descuentoMonto = 0;
 
-    // ── LADRILLOS (plataformas flotantes) ─────────────────────
-    // ladrillo.png es ahora 285×268 — usamos la imagen completa sin recorte.
-    const BRICK_W = 36, BRICK_H = 36;
-    const BRICK_SRC_W = 285;
-    const BRICK_SRC_H = 268;
-    const brickSrc = this.textures.get('ladrillo').getSourceImage();
+  if (discountType === 'porcentaje') {
+    const porcentaje = Math.min(Math.max(discountValue, 0), 100);
+    descuentoMonto = subtotal * (porcentaje / 100);
+  } else {
+    descuentoMonto = Math.min(Math.max(discountValue, 0), subtotal);
+  }
 
-    const brickCanvas = document.createElement('canvas');
-    brickCanvas.width  = BRICK_SRC_W;
-    brickCanvas.height = BRICK_SRC_H;
-    brickCanvas.getContext('2d').drawImage(brickSrc, 0, 0, BRICK_SRC_W, BRICK_SRC_H);
+  const total = Math.max(0, subtotal - descuentoMonto);
 
-    if (this.textures.exists('brick_crop')) {
-        this.textures.remove('brick_crop');
+  return {
+    subtotal,
+    descuentoMonto,
+    total
+  };
+}
+document.querySelectorAll('.discount-type').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.discount-type')
+      .forEach(b => b.classList.remove('active'));
+
+    btn.classList.add('active');
+
+    discountType = btn.dataset.discountType;
+
+    const input = document.getElementById('order-discount-value');
+    discountValue = parseFloat(input?.value) || 0;
+
+    renderCart();
+  });
+});
+document.getElementById('order-discount-value')
+.addEventListener('input', e => {
+  discountValue = parseFloat(e.target.value) || 0;
+  renderCart();
+});
+function updateMixto() {
+  const { total } = getSaleTotals();
+  const qr       = parseFloat(document.getElementById('mixto-qr').value)       || 0;
+  const efectivo = parseFloat(document.getElementById('mixto-efectivo').value) || 0;
+  const tarjeta  = parseFloat(document.getElementById('mixto-tarjeta').value)  || 0;
+  const ingresado = qr + efectivo + tarjeta;
+  const left = total - ingresado;
+  const statusEl = document.getElementById('mixto-status');
+  if (ingresado === 0) {
+    statusEl.textContent = '';
+    statusEl.className = 'mixto-status';
+    document.getElementById('co-confirm').disabled = true;
+  } else if (left > 0) {
+    statusEl.textContent = `Falta Bs ${fmt(left)}`;
+    statusEl.className = 'mixto-status falta';
+    document.getElementById('co-confirm').disabled = true;
+  } else {
+    statusEl.textContent = left < -1 ? `Cambio: Bs ${fmt(Math.abs(left))}` : '✓ Monto completo';
+    statusEl.className = 'mixto-status ok';
+    document.getElementById('co-confirm').disabled = false;
+  }
+}
+
+document.querySelectorAll('.mixto-input').forEach(input => input.addEventListener('input', updateMixto));
+
+document.getElementById('btn-checkout').addEventListener('click', () => {
+  if (!cajaEstaAbierta()) {
+    showToast('🔒 Abre la caja primero para cobrar', 3500);
+    return;
+  }
+  pendingVentaTimestamp = null;
+  pendingSavedVenta = null;
+  document.getElementById('post-sale-print').classList.remove('show');
+  pendingComandaData = null;
+  const printBtn = document.getElementById('print-comanda-btn');
+  printBtn.disabled = false;
+  printBtn.textContent = 'IMPRIMIR COMANDA';
+  const { total } = getSaleTotals();
+  document.getElementById('co-total').textContent = `Bs ${fmt(total)}`;
+  selectedPaymentMethod = null;
+  document.querySelectorAll('.pay-btn').forEach(btn => btn.classList.remove('selected'));
+  document.getElementById('co-confirm').disabled = true;
+  document.getElementById('cash-input-area').style.display = 'none';
+  document.getElementById('mixto-input-area').style.display = 'none';
+  document.querySelectorAll('.mixto-input').forEach(i => i.value = '');
+  document.getElementById('cash-received').value = '';
+  document.getElementById('cash-feedback').textContent = '';
+  document.getElementById('cash-feedback').className = 'cash-feedback';
+  document.getElementById('mixto-status').textContent = '';
+  document.getElementById('mixto-status').className = 'mixto-status';
+  document.getElementById('checkout-modal').classList.add('open');
+});
+
+document.querySelectorAll('.pay-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.pay-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    selectedPaymentMethod = btn.dataset.method;
+    document.getElementById('cash-input-area').style.display = 'none';
+    document.getElementById('mixto-input-area').style.display = 'none';
+    document.getElementById('co-confirm').disabled = false;
+    if (selectedPaymentMethod === 'efectivo') {
+      document.getElementById('cash-input-area').style.display = 'block';
+      document.getElementById('cash-received').value = '';
+      document.getElementById('cash-feedback').textContent = '';
+      document.getElementById('cash-feedback').className = 'cash-feedback';
+      document.getElementById('cash-received').focus();
+      document.getElementById('co-confirm').disabled = true;
+    } else if (selectedPaymentMethod === 'mixto') {
+      document.getElementById('mixto-input-area').style.display = 'block';
+      document.getElementById('co-confirm').disabled = true;
+      updateMixto();
     }
+  });
+});
 
-    this.textures.addCanvas('brick_crop', brickCanvas);
+document.getElementById('cash-received').addEventListener('input', (e) => {
+  const { total } = getSaleTotals();
+  const received = parseFloat(e.target.value) || 0;
+  const fb       = document.getElementById('cash-feedback');
+  const diff     = total - received;
+  if (received === 0) {
+    fb.textContent = '';
+    fb.className = 'cash-feedback';
+    document.getElementById('co-confirm').disabled = true;
+  } else if (diff > 0) {
+    fb.textContent = `Falta Bs ${fmt(diff)}`;
+    fb.className = 'cash-feedback falta';
+    document.getElementById('co-confirm').disabled = true;
+  } else if (diff < 0) {
+    fb.textContent = `Cambio: Bs ${fmt(Math.abs(diff))}`;
+    fb.className = 'cash-feedback ok';
+    document.getElementById('co-confirm').disabled = false;
+  } else {
+    fb.textContent = '✓ Monto exacto';
+    fb.className = 'cash-feedback ok';
+    document.getElementById('co-confirm').disabled = false;
+  }
+});
 
-    // Bloque de trago: cuadro amarillo con marco café y un corazón,
-    // mientras no se usó. Una vez golpeado, queda fijo como bloque
-    // café plano (como piedra), sin corazón.
-    this._crearTexturaBloque('block_question', true);
-    this._crearTexturaBloque('block_used', false);
+document.getElementById('co-cancel').addEventListener('click', () => {
+  pendingVentaTimestamp = null;
+  pendingSavedVenta = null;
+  document.getElementById('checkout-modal').classList.remove('open');
+});
 
-    // Textura bloque multi-moneda (amarillo con círculo dorado = moneda)
-    if (!this.textures.exists('block_coin')) {
-      const BC = 64;
-      const bc = document.createElement('canvas');
-      bc.width = bc.height = BC;
-      const bx = bc.getContext('2d');
-      bx.fillStyle = '#FFD447'; bx.fillRect(0, 0, BC, BC);
-      bx.strokeStyle = '#6B4423'; bx.lineWidth = 6;
-      bx.strokeRect(3, 3, BC - 6, BC - 6);
-      bx.fillStyle = '#6B4423';
-      const r2 = 6;
-      [[10,10],[BC-10,10],[10,BC-10],[BC-10,BC-10]].forEach(([cx,cy]) =>
-        bx.fillRect(cx - r2/2, cy - r2/2, r2, r2));
-      // Moneda dorada en el centro
-      bx.beginPath();
-      bx.arc(BC/2, BC/2 + 2, 14, 0, Math.PI * 2);
-      bx.fillStyle = '#FFD700'; bx.fill();
-      bx.strokeStyle = '#B8860B'; bx.lineWidth = 2.5; bx.stroke();
-      bx.beginPath();
-      bx.arc(BC/2, BC/2 + 2, 8, 0, Math.PI * 2);
-      bx.strokeStyle = '#FFF176'; bx.lineWidth = 1.5; bx.stroke();
-      this.textures.addCanvas('block_coin', bc);
+function fmt(n) {
+  return String(Math.round(Number(n) || 0));
+}
+
+function formatReceiptCaja(caja) {
+  const value = String(caja || '').trim().replace(/^caja\s*/i, '');
+  return value || '—';
+}
+
+function formatReceiptDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const yyyy = date.getFullYear();
+  const hours24 = date.getHours();
+  const hours12 = String(hours24 % 12 || 12).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const suffix = hours24 >= 12 ? 'PM' : 'AM';
+  return `${dd}-${mm}-${yyyy} ${hours12}:${minutes}${suffix}`;
+}
+
+let lastOrderReference = null;
+
+function updateOrderNumberDisplay(orderReference = lastOrderReference) {
+  document.getElementById('order-number-display').textContent =
+    orderReference ? '#' + orderReference : '#—';
+}
+
+let impresora = null;
+let pendingComandaData = null;
+
+function usbText(value) {
+  return String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x20-\x7E]/g, '');
+}
+
+function wrapUsbText(value, width = 32) {
+  const words = usbText(value).trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return [''];
+  const lines = [];
+  let line = '';
+  for (const word of words) {
+    if (!line) {
+      if (word.length <= width) line = word;
+      else {
+        for (let i = 0; i < word.length; i += width) lines.push(word.slice(i, i + width));
+      }
+    } else if ((line + ' ' + word).length <= width) {
+      line += ' ' + word;
+    } else {
+      lines.push(line);
+      line = word.length <= width ? word : '';
+      if (!line) {
+        for (let i = 0; i < word.length; i += width) lines.push(word.slice(i, i + width));
+      }
     }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
 
-    // Textura moneda pequeña (para la animación al romper ladrillo o golpear bloque)
-    if (!this.textures.exists('moneda_small')) {
-      const MS = 18;
-      const mc = document.createElement('canvas');
-      mc.width = mc.height = MS;
-      const mx = mc.getContext('2d');
-      mx.beginPath(); mx.arc(MS/2, MS/2, MS/2 - 1, 0, Math.PI * 2);
-      mx.fillStyle = '#FFD700'; mx.fill();
-      mx.strokeStyle = '#B8860B'; mx.lineWidth = 2; mx.stroke();
-      mx.beginPath(); mx.arc(MS/2, MS/2, MS/2 - 5, 0, Math.PI * 2);
-      mx.strokeStyle = '#FFF176'; mx.lineWidth = 1.5; mx.stroke();
-      this.textures.addCanvas('moneda_small', mc);
+function escPosTextLine(value, width = 32) {
+  // Algunas Epson no reinician la columna con LF solo. CRLF garantiza que
+  // cada línea vuelva al inicio antes de avanzar al siguiente renglón.
+  return wrapUsbText(value, width)
+    .map(line => usbText(line) + '\r\n')
+    .join('');
+}
+
+function buildEscPosFromComanda(printArea) {
+  if (!printArea || !printArea.textContent.trim()) {
+    throw new Error('La comanda no tiene contenido para imprimir');
+  }
+
+  const encoder = new TextEncoder();
+  const ESC = 0x1b;
+  const GS = 0x1d;
+  const chunks = [];
+  const push = (...bytes) => chunks.push(Uint8Array.from(bytes));
+  const pushText = value => chunks.push(encoder.encode(usbText(value)));
+  const pushLine = value => chunks.push(encoder.encode(escPosTextLine(value)));
+  const pushBlock = value => {
+    const lines = String(value || '')
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+    lines.forEach(line => pushLine(line));
+  };
+  let productSectionStarted = false;
+
+  /*
+   * ESC/POS no recibe HTML/CSS. Para no perder nada, recorremos el DOM real
+   * de la comanda en el mismo orden en que está construido. Las filas de
+   * productos conservan cantidad + nombre; cualquier otro bloque, incluido
+   * lo que esté debajo de los productos, también se convierte en líneas.
+   */
+  const addTextLines = value => {
+    String(value || '')
+      .split(/\r?\n/)
+      .map(line => line.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .forEach(line => pushLine(line));
+  };
+  const walkComanda = node => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      addTextLines(node.nodeValue);
+      return;
     }
-
-    // Animación giratoria de la moneda — usa los frames reales del atlas
-    // (el frame 080 no existe en el JSON, así evitamos generar nombres a ciegas)
-    if (!this.anims.exists('moneda_giro')) {
-      const monedaFrameNames = this.textures.get('moneda').getFrameNames();
-      monedaFrameNames.sort();   // orden numérico correcto
-      this.anims.create({
-        key: 'moneda_giro',
-        frames: monedaFrameNames.map(f => ({ key: 'moneda', frame: f })),
-        frameRate: 28,
-        repeat: 0,
-      });
-    }
-
-    // Tres alturas de plataforma (y = borde inferior del ladrillo)
-    const S  = 52;               // paso entre centros de ladrillos
-    const L  = GROUND_Y - 128;  // bajo  — alcanzable desde el suelo
-    const M  = GROUND_Y - 210;  // medio — alcanzable desde nivel L
-    const HI = GROUND_Y - 292;  // alto  — alcanzable desde nivel M
-    const L3 = L - 3 * BRICK_H; // 3 ladrillos arriba de L
-
-    const brickDefs = [
-      // ── Inicio: 1 ladrillo solo ── (ladrillo de trago: no se rompe, da un trago)
-      [200,L,'trago'],
-
-      // ── Sección 0: fila de 5 — 1 bloque ?×5, 1 bloque ?×1 ──
-      [380,L],[416,L,'monedas'],[452,L,'moneda'],[488,L,'moneda1'],[524,L],
-      [452,L3],
-
-      // ── Sección 2 (tras hueco 1, x=2720-3150) ──────────────────
-      [2760,L,'flor'],[2796,L],[2832,L],
-      // fila flotante — 1 bloque ?×5, 1 bloque ?×1
-      [2832,M],[2868,M,'monedas'],[2904,M],[2940,M,'moneda1'],[2976,M],
-      [3012,M],[3048,M],[3084,M],[3120,M],
-
-      // ── Sección 3 (tras hueco 2, x=3400+) ─────────────────────
-      // fila de 5 — 1 bloque ?×5, 1 bloque ?×1
-      [3450,M],[3486,M,'monedas'],[3522,M,'moneda'],[3558,M,'moneda1'],[3594,M],
-      [3594,L],
-      [3720,M],[3756,M],
-      // 3 ladrillos aislados — el del medio es bloque ?×5
-      [4000,L],[4144,L,'monedas'],[4288,L],
-      [4144,L3],
-
-      // ── Sección 4 (x > 4800) ─────────────────────────────────────────
-      [4900, L, 'moneda'],
-      [5060, L], [5096, L],
-      // fila M — 1 bloque ?×5, 2 bloques ?×1
-      [5060, M, 'moneda'], [5096, M,'monedas'], [5132, M], [5168, M,'moneda1'],
-      [5300, M], [5336, M,'moneda1'], [5372, M], [5408, M],
-      [5336, L], [5372, L],
-
-      // ── Sección 5 (zona final) ──────────────────────────────────
-      // 1 bloque ?×5, 1 bloque ?×1
-      [7126, L,'monedas'], [7162, L], [7198, L,'moneda'], [7234, L,'moneda1'],
-    ];
-
-    this.bricks = this.physics.add.staticGroup();
-
-    brickDefs.forEach(([bx, topY, tipoDef]) => {
-      const tipo = tipoDef || 'break';
-      // Los bloques de trago usan la textura "?" en vez del ladrillo normal.
-      const textura = (
-          tipo === 'trago' ||
-          tipo === 'moneda' ||
-          tipo === 'monedas' ||
-          tipo === 'moneda1' ||
-          tipo === 'flor'
-      ) ? 'block_question' : 'brick_crop';
-      // setOrigin(0.5, 1) → el punto de anclaje es la base central del ladrillo
-      const b = this.bricks.create(bx, topY, textura);
-      b.setOrigin(0.5, 1)
-       .setDisplaySize(BRICK_W, BRICK_H)
-       .refreshBody();
-      // tipo: 'break' (default, se rompe al golpear desde abajo) | 'trago' (no se rompe, da un trago)
-      b.setData('tipo', tipo);
-      b.setData('usado', false);
-    });
-
-    // ── TILES (escaleras con tiles.png) ───────────────────────
-    // El PNG ya tiene fondo transparente. Solo se recorta al cubo real
-    // para que ocupe correctamente 36×36 px al mostrarse en pantalla.
-    const tileSrc = this.textures.get('tile_block').getSourceImage();
-    const T_CX = 460, T_CY = 220, T_CW = 600, T_CH = 560;
-    const tileCanvas = document.createElement('canvas');
-    tileCanvas.width = T_CW; tileCanvas.height = T_CH;
-    tileCanvas.getContext('2d').drawImage(
-      tileSrc, T_CX, T_CY, T_CW, T_CH, 0, 0, T_CW, T_CH
-    );
-    if (this.textures.exists('tile_crop')) this.textures.remove('tile_crop');
-    this.textures.addCanvas('tile_crop', tileCanvas);
-
-    const TILE_S = 36;
-    this.stairTiles = this.physics.add.staticGroup();
-
-    const _tile = (x, y) => {
-      const t = this.stairTiles.create(x, y, 'tile_crop');
-      // Display 6px más grande que el paso (36) para solapar y cerrar huecos visuales
-      t.setOrigin(0.5, 1).setDisplaySize(TILE_S + 6, TILE_S + 6).refreshBody();
-    };
-
-    // Escaleras: 4 columnas ascendentes [1,2,3,4] → la más baja a la izquierda,
-    // la más alta a la derecha. El jugador las sube saltando de izquierda a derecha.
-    const stairH = [1, 2, 3, 4];
-
-    const crearEscalera = (x0, reverse = false) => {
-      const cols = reverse ? [...stairH].reverse() : stairH;
-      cols.forEach((h, c) => {
-        const cx = x0 + c * TILE_S + TILE_S / 2;
-        for (let row = 0; row < h; row++) {
-          _tile(cx, GROUND_Y - row * TILE_S);
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+   if (node.tagName === 'HR') {
+     push(ESC, 0x61, 0x01); // centrar
+     pushText('------------------------------------------');
+     push(0x0A);
+     push(ESC, 0x61, 0x00); // volver a izquierda
+     return;
+   }
+    if (node.classList.contains('p-item-row')) {
+      const qty = node.querySelector('.p-item-qty')?.textContent.trim() || '';
+      const name = node.querySelector('.p-item-name')?.textContent.trim() || '';
+      if (qty || name) {
+        // El encabezado puede ir centrado, pero las filas deben empezar en
+        // la misma columna para que "|" y todos los nombres queden alineados.
+        if (!productSectionStarted) {
+          push(ESC, 0x61, 0x00);
+          productSectionStarted = true;
         }
-      });
-    };
+        // Columna fija: 4 posiciones para cantidad, luego el separador.
+        // Así el producto siempre empieza exactamente después de "|".
+        const wrapped = wrapUsbText(name, 27);
 
-    //  ┌─ IZQUIERDA (4 cols) ─┐  GAP 3 tiles  ┌─ DERECHA (4 cols) ─┐
-    const STAIR_X = 5600;
-    const GAP_W   = 3 * TILE_S;   // 108 px
-    const SEC_W   = 4 * TILE_S;   // 144 px
-    crearEscalera(STAIR_X);                               // escalera izquierda [1,2,3,4] ↑
-    crearEscalera(STAIR_X + SEC_W + GAP_W, true);         // escalera derecha   [4,3,2,1] ↓
+        // Mueve TODO el bloque de productos hacia la derecha
+        const indent = ' ';
 
-    // ── Pirámide: [1,2,3,4,5] · hueco 2 tiles · [5,4,3,2,1] ──────────
-    const pyramidH = [1, 2, 3, 4, 5];
-    const PYRA_COL  = 5 * TILE_S;   // 180 px cada mitad
-    const PYRA_GAP  = 2 * TILE_S;   // 72 px de hueco central
-    const SPACE_6   = 6 * TILE_S;   // 216 px de separación antes de la pirámide
+        // CANTIDAD SIEMPRE ocupa exactamente 4 caracteres
+        const quantity = usbText(qty).padStart(2, ' ').padEnd(4, ' ');
 
-    // X de inicio de la pirámide = fin de escalera derecha + 6 tiles
-    const PYRA_X = STAIR_X + SEC_W + GAP_W + SEC_W + SPACE_6;
+        // Producto
+        pushText(`${indent}${quantity}| ${wrapped[0]}`);
+        push(0x0A);
 
-    const crearMitadPiramide = (x0, alturas) => {
-      alturas.forEach((h, c) => {
-        const cx = x0 + c * TILE_S + TILE_S / 2;
-        for (let row = 0; row < h; row++) {
-          _tile(cx, GROUND_Y - row * TILE_S);
-        }
-      });
-    };
-
-    crearMitadPiramide(PYRA_X,              pyramidH);                    // [1,2,3,4,5] ↑
-    crearMitadPiramide(PYRA_X + PYRA_COL + PYRA_GAP, [...pyramidH].reverse()); // [5,4,3,2,1] ↓
-
-    // ── Escalera final [1,2,3,4,5,6,7,8,8] pegada al tubo 6 ───────────
-    // Tubo 6 centrado en x=7490, tw=92 → borde derecho = 7490+46 = 7536
-    const finalH = [1, 2, 3, 4, 5, 6, 7, 8, 8];
-    const FINAL_X = 7536; // x0: borde derecho del tubo 6
-    finalH.forEach((h, c) => {
-      const cx = FINAL_X + c * TILE_S + TILE_S / 2;
-      for (let row = 0; row < h; row++) {
-        _tile(cx, GROUND_Y - row * TILE_S);
-      }
-    });
-
-    // ── ZONA BOSS (roca 3,3 · lava×5 · roca 3,3) ─────────────
-    // El piso termina en x=7860 (pie del último tile).
-    // Patrón: [roca col 0][roca col 1][lava×5][roca col 2][roca col 3]
-    // Las rocas son sólidas (stairTiles); la lava es visual — caer = muerte.
-    const BOSS_X    = 7860;
-    const LAVA_W    = 96;    // ancho de cada trozo de lava
-    const LAVA_H    = 200;   // alto: se extiende bien hacia abajo (pit visible)
-    const LAVA_N    = 5;     // cantidad de trozos
-    const ROCA_COLS = 3;     // 3 columnas de roca en cada lado (3,3)
-    const ROCA_ROWS = 3;     // filas de roca (altura)
-
-    // Crop de roca.png al contenido real del cubo (1536×1024, misma estructura que tiles.png)
-    const rocaSrc = this.textures.get('roca').getSourceImage();
-    const R_CX = 460, R_CY = 220, R_CW = 600, R_CH = 560;
-    const rocaCanvas = document.createElement('canvas');
-    rocaCanvas.width = R_CW; rocaCanvas.height = R_CH;
-    rocaCanvas.getContext('2d').drawImage(rocaSrc, R_CX, R_CY, R_CW, R_CH, 0, 0, R_CW, R_CH);
-    if (this.textures.exists('roca_crop')) this.textures.remove('roca_crop');
-    this.textures.addCanvas('roca_crop', rocaCanvas);
-
-    // Función para colocar tile de roca del mismo tamaño que los ladrillos (36×36)
-    const _roca = (x, y) => {
-      const r = this.stairTiles.create(x, y, 'roca_crop');
-      r.setOrigin(0.5, 1).setDisplaySize(36, 36).refreshBody();
-    };
-
-    // Rocas izquierdas (2 col × 3 filas)
-    for (let c = 0; c < ROCA_COLS; c++) {
-      const cx = BOSS_X + c * TILE_S + TILE_S / 2;
-      for (let row = 0; row < ROCA_ROWS; row++) {
-        _roca(cx, GROUND_Y - row * TILE_S);
-      }
-    }
-
-    // Lava visual (sin colisión — caer sobre la lava = muerte por caída)
-    const lavaStartX = BOSS_X + ROCA_COLS * TILE_S;
-    for (let i = 0; i < LAVA_N; i++) {
-      const lx = lavaStartX + i * LAVA_W + LAVA_W / 2;
-      // y=H → el fondo de la lava queda al fondo de pantalla; sube LAVA_H px
-      this.add.image(lx, H, 'lava')
-        .setOrigin(0.5, 1)
-        .setDisplaySize(LAVA_W, LAVA_H);
-    }
-
-    // Rocas derechas (2 col × 3 filas)
-    const rocaRightX = lavaStartX + LAVA_N * LAVA_W;
-    for (let c = 0; c < ROCA_COLS; c++) {
-      const cx = rocaRightX + c * TILE_S + TILE_S / 2;
-      for (let row = 0; row < ROCA_ROWS; row++) {
-        _roca(cx, GROUND_Y - row * TILE_S);
-      }
-    }
-
-    // ── FIN DEL NIVEL ──────────────────────────────────────────
-    // La última roca (después del puente) es el final de la pantalla:
-    // el mundo y la cámara terminan justo en su borde derecho, así no
-    // hay nada más allá y esa roca queda como el límite del juego.
-    const LEVEL_END_X = rocaRightX + ROCA_COLS * TILE_S;
-    this.physics.world.setBounds(0, 0, LEVEL_END_X, H + 600);
-    this.cameras.main.setBounds(0, 0, LEVEL_END_X, H);
-
-    // ── PUENTE (cruza la lava, caminable) ─────────────────────
-    // Recorte de puente.png (1536×1024) al contenido real del puente
-    // (franja horizontal de tablones, sin los bordes transparentes).
-    const puenteSrc = this.textures.get('puente').getSourceImage();
-    const PU_CX = 35, PU_CY = 387, PU_CW = 1438, PU_CH = 152;
-    const puenteCanvas = document.createElement('canvas');
-    puenteCanvas.width = PU_CW; puenteCanvas.height = PU_CH;
-    puenteCanvas.getContext('2d').drawImage(puenteSrc, PU_CX, PU_CY, PU_CW, PU_CH, 0, 0, PU_CW, PU_CH);
-    if (this.textures.exists('puente_crop')) this.textures.remove('puente_crop');
-    this.textures.addCanvas('puente_crop', puenteCanvas);
-
-    // El puente cubre todo el ancho de la lava y queda a la misma altura
-    // que la parte de arriba de las rocas, para que se pueda cruzar
-    // caminando en vez de tener que saltar sobre la lava.
-    const BRIDGE_W     = LAVA_N * LAVA_W;                 // ancho = todo el tramo de lava
-    const BRIDGE_H     = 40;
-    const BRIDGE_TOP_Y = GROUND_Y - ROCA_ROWS * TILE_S;   // nivel superior de las rocas
-    const bridgeCenterX = lavaStartX + BRIDGE_W / 2;
-
-    const bridge = this.stairTiles.create(bridgeCenterX, BRIDGE_TOP_Y + BRIDGE_H, 'puente_crop');
-    bridge.setOrigin(0.5, 1)
-      .setDisplaySize(BRIDGE_W, BRIDGE_H)
-      .refreshBody();
-
-    // Referencia para la transición de cielo en update()
-    this._skyStart = 7200;   // x donde empieza el fade
-    this._skyEnd   = BOSS_X; // x donde el cielo es completamente negro
-
-
-
-    const elefanteCaminarFrames = [];
-    for (let i = 35; i <= 75; i++) {
-      elefanteCaminarFrames.push({ key: 'elefante_camino', frame: `ezgif-frame-${String(i).padStart(3, '0')}_pixian_ai.png` });
-    }
-    this.anims.create({
-      key: 'elefante_caminar',
-      frames: elefanteCaminarFrames,
-      frameRate: 14,
-      repeat: -1,
-    });
-
-    const elefanteSaltarFrames = [];
-    for (let i = 76; i <= 95; i++) {
-      if (i === 92) continue; // ese frame no existe en el atlas
-      elefanteSaltarFrames.push({ key: 'elefante_salto', frame: `ezgif-frame-${String(i).padStart(3, '0')}_pixian_ai.png` });
-    }
-    this.anims.create({
-      key: 'elefante_saltar',
-      frames: elefanteSaltarFrames,
-      frameRate: 14,
-      repeat: 0,
-    });
-
-    const ELEFANTE_SCALE = 0.27;
-    this._elefanteSpeed  = 55;
-    this.elefante = this.physics.add.sprite(
-      bridgeCenterX, BRIDGE_TOP_Y, 'elefante_camino', 'ezgif-frame-035_pixian_ai.png',
-    );
-    this.elefante.setOrigin(0.5, 1);
-    this.elefante.setScale(ELEFANTE_SCALE);
-    this.elefante.setCollideWorldBounds(true);
-    this.elefante.body.setSize(400, 369);
-    this.elefante.body.setOffset(140, 0);
-    this.elefante.play('elefante_caminar');
-
-    // Límites del puente: el elefante camina de punta a punta.
-    const elefanteHalfW = (400 * ELEFANTE_SCALE) / 2;
-    this._elefanteXIzq = lavaStartX + BRIDGE_W / 2;   // solo la mitad derecha del puente
-    this._elefanteXDer  = lavaStartX + BRIDGE_W - elefanteHalfW;
-    this._elefanteDir   = 1;
-    this._bridgeTopY    = BRIDGE_TOP_Y;   // guardado para muerte en lava
-    this._lavaStartX    = lavaStartX;
-    this._levelEndX     = LEVEL_END_X;    // guardado para secuencia victoria
-
-    // ── Variables de boss ───────────────────────────────────────
-    this._elefanteHP         = 3;
-    this._elefanteState      = 'caminar';
-    this._elefanteInvincible = false;
-    this._elefanteMuerto     = false;   // guard: true cuando el boss muere
-    this._winSequence        = false;   // true durante la caminata al castillo
-    this._bossBar            = null;
-
-    // ── Salto periódico del elefante ──────────────────────────
-    this.time.addEvent({
-      delay: 3200,
-      loop: true,
-      callback: () => {
-        if (this._elefanteState !== 'caminar' || this._elefanteMuerto) return;
-        this._elefanteState = 'saltar';
-        this.elefante.setVelocityX(0);
-        this.elefante.play('elefante_saltar');
-        this.elefante.setVelocityY(-420);
-      },
-    });
-
-    // ── Orbes mágicos: lanza uno hacia la llama cada 2.5 s ───
-    this.bolasElefante = this.physics.add.group();
-    this._bolaTimer = this.time.addEvent({
-      delay: 2500,
-      loop: true,
-      callback: () => this._lanzarBolaElefante(),
-    });
-    // Misil del elefante: viaja recto (sin gravedad).
-    // Al tocar suelo, escaleras o tubos → explota y se destruye.
-    const _destruirOrb = (a, b) => {
-      const orb = (a && a.active && a.body && a !== this.elefante) ? a
-                : (b && b.active && b.body && b !== this.elefante) ? b
-                : null;
-      if (!orb || !orb.scene) return;
-      this.time.delayedCall(16, () => {
-        if (orb && orb.scene) { this._explotar(orb.x, orb.y); orb.destroy(); }
-      });
-    };
-    this.floorBodies.forEach(floor =>
-      this.physics.add.collider(this.bolasElefante, floor, _destruirOrb)
-    );
-    this.physics.add.collider(this.bolasElefante, this.stairTiles, _destruirOrb);
-    this.physics.add.collider(this.bolasElefante, this.tubes,      _destruirOrb);
-
-    // Colisión con el piso/rocas/puente: al aterrizar retoma la caminata.
-    this.floorBodies.forEach(fb => this.physics.add.collider(this.elefante, fb));
-    this.physics.add.collider(this.elefante, this.stairTiles, () => {
-      if (this.elefante.body.blocked.down && this._elefanteState === 'saltar') {
-        this._elefanteState = 'caminar';
-        this.elefante.play('elefante_caminar');
-      }
-    });
-
-    // ── ENEMIGO "GOOMBA" ───────────────────────────────────────
-    // Animación de caminata usando los 40 frames del atlas.
-    const goombaFrames = [];
-    for (let i = 28; i <= 64; i++) {
-      goombaFrames.push({ key: 'goomba', frame: `ezgif-frame-${String(i).padStart(3, '0')}_pixian_ai.png` });
-    }
-    this.anims.create({
-      key: 'goomba_caminar',
-      frames: goombaFrames,
-      frameRate: 16,
-      repeat: -1,
-    });
-
-    this.enemies = this.physics.add.group();
-
-    // [x_inicial, dirección inicial: 1 = derecha, -1 = izquierda]
-    const enemyDefs = [
-      // ── Zona de tubos 1-4 (originales, sin cambios) ──
-      [708,  -1],  // sale del tubo 1 hacia la izquierda
-      [1255,  1],  // entre tubo 2 y tubo 3
-      [1684,  1],  // entre tubo 3 y tubo 4
-      [1724, -1],  // pareja del anterior
-
-      // ── Sección 2 (tras hueco 1, x≈2720-3150) ──
-      [2850,  1],
-      [2980, -1],
-      [3080,  1],
-
-      // ── Sección 3 (tras hueco 2, x≈3400-5500) ──
-      [3500,  1],
-      [3750, -1],
-      [4000,  1],
-      [4280, -1],
-      [4550,  1],
-      [4850, -1],
-      [5150,  1],
-      [5400, -1],
-
-      // ── Sección final (x≈6000-7500) ──
-      [6200,  1],
-      [6500, -1],
-      [6800,  1],
-      [7300, -1],
-    ];
-    enemyDefs.forEach(([ex, dir]) => this._crearGoomba(ex, dir));
-
-    // ── TUBOS (obstáculos sobre el piso) ─────────────────────
-    // Formato: [x_centro, ancho_display, alto_display]
-    // Los 4 primeros crecen progresivamente; 4to == 3ro
-    const tuboDefs = [
-      [ 668,  92, 107],  // tubo 1 – tamaño base
-      [1042, 105, 122],  // tubo 2 – un poco más alto
-      [1468, 118, 137],  // tubo 3 – un poco más alto que el 2
-      [1940, 118, 137],  // tubo 4 – mismo tamaño que el 3
-      [6870,  92, 107],  // tubo 5 – pequeño (movido más a la izquierda)
-      [7490,  92, 107],  // tubo 6 – mismo tamaño
-    ];
-
-    this.tubes = this.physics.add.staticGroup();
-    tuboDefs.forEach(([tx, tw, th]) => {
-      const t = this.tubes.create(tx, GROUND_Y, 'tubo');
-      t.setOrigin(0.5, 1)
-       .setDisplaySize(tw, th)
-       .refreshBody();
-    });
-
-    // El goomba camina sobre el piso y da la vuelta al chocar con un tubo.
-    this.floorBodies.forEach(fb => this.physics.add.collider(this.enemies, fb));
-    this.physics.add.collider(this.enemies, this.tubes);
-
-    // ── LLAMA (jugador) ───────────────────────────────────────
-    const IDLE_FRAME = 'ezgif-frame-001 - copia (2).png';
-    this.IDLE_FRAME  = IDLE_FRAME;
-    this._state      = 'idle';   // 'idle' | 'caminar' | 'saltar'
-    this._subiendo   = false;    // true mientras la llama sube tras saltar
-
-  // Estado de poder: 'small' → 'normal' (moneda) → 'capa' (flor)
-    this._powerState = 'small';
-    this._invincible  = false;   // invencibilidad post-golpe (como Mario)
-
-    this.llama = this.physics.add.sprite(80, GROUND_Y + 4, 'idle', IDLE_FRAME);
-    this.llama.setOrigin(0.5, 1);
-    this.llama.setScale(LLAMA_SCALE_SMALL);   // empieza pequeña
-    this.llama.setCollideWorldBounds(true);
-
-    // Aplica hitbox según el estado de poder actual
-    this._applyLlamaHitbox();
-
-    // ── ANIMACIONES ───────────────────────────────────────────
-    this.anims.create({
-      key: 'caminar',
-      frames: [
-        { key: 'llama', frame: 'ezgif-frame-003.png' },
-        { key: 'llama', frame: 'ezgif-frame-004.png' },
-        { key: 'llama', frame: 'ezgif-frame-005.png' },
-        { key: 'llama', frame: 'ezgif-frame-006.png' },
-        { key: 'llama', frame: 'ezgif-frame-007.png' },
-        { key: 'llama', frame: 'ezgif-frame-008.png' },
-        { key: 'llama', frame: 'ezgif-frame-009.png' },
-        { key: 'llama', frame: 'ezgif-frame-010.png' },
-      ],
-      frameRate: 10, repeat: -1,
-    });
-
-    this.anims.create({
-      key: 'saltar',
-      frames: [
-        { key: 'jump', frame: 'ezgif-frame-020.png' },
-        { key: 'jump', frame: 'ezgif-frame-021.png' },
-        { key: 'jump', frame: 'ezgif-frame-024.png' },
-        { key: 'jump', frame: 'ezgif-frame-025.png' },
-        { key: 'jump', frame: 'ezgif-frame-026.png' },
-        { key: 'jump', frame: 'ezgif-frame-027.png' },
-        { key: 'jump', frame: 'ezgif-frame-028.png' },
-        { key: 'jump', frame: 'ezgif-frame-029.png' },
-        { key: 'jump', frame: 'ezgif-frame-030.png' },
-        { key: 'jump', frame: 'ezgif-frame-031.png' },
-        { key: 'jump', frame: 'ezgif-frame-032.png' },
-        { key: 'jump', frame: 'ezgif-frame-033.png' },
-        { key: 'jump', frame: 'ezgif-frame-034.png' },
-        { key: 'jump', frame: 'ezgif-frame-035.png' },
-        { key: 'jump', frame: 'ezgif-frame-036.png' },
-        { key: 'jump', frame: 'ezgif-frame-037.png' },
-        { key: 'jump', frame: 'ezgif-frame-038.png' },
-        { key: 'jump', frame: 'ezgif-frame-040.png' },
-        { key: 'jump', frame: 'ezgif-frame-041.png' },
-      ],
-      frameRate: 14, repeat: 0,
-    });
-
-    // ── Animaciones CAPA (fondo ya transparente en los PNGs) ──────────
-    // caminocapa: 20 frames (001–020)
-    this.anims.create({
-      key: 'caminar_capa',
-      frames: this.textures.get('caminocapa').getFrameNames().sort().map(f => ({ key: 'caminocapa', frame: f })),
-      frameRate: 12,
-      repeat: -1,
-    });
-    // saltocapa: todos los frames del atlas (021–044, solo los que existen)
-    this.anims.create({
-      key: 'saltar_capa',
-      frames: this.textures.get('saltocapa').getFrameNames().sort().map(f => ({ key: 'saltocapa', frame: f })),
-      frameRate: 14,
-      repeat: 0,
-    });
-
-    // ── COLISIONES ────────────────────────────────────────────
-    this.floorBodies.forEach(fb => this.physics.add.collider(this.llama, fb));
-    this.physics.add.collider(this.llama, this.tubes);
-
-    // Pisar CABEZA del elefante → boss aturdido + llama rebota.
-    // Tocar de costado/abajo → llama pierde poder.
-    this.physics.add.collider(this.llama, this.elefante, (llama, elefante) => {
-      if (this._elefanteMuerto || !elefante.active) return;
-      const falling = llama.body.velocity.y > -80;   // cualquier contacto desde arriba
-      const above   = llama.body.bottom < elefante.body.top + 40;  // tolerancia generosa
-      if (falling && above && this._elefanteState !== 'aturdido') {
-        llama.setVelocityY(-380);
-        this._elefanteAturdirPorPison();
-      } else {
-        this._takeDamage();
-      }
-    });
-
-    // Misil del boss: detección manual en update() — ver _checkMisiles()
-    this.physics.add.collider(this.llama, this.bricks, (llama, brick) => {
-      // _subiendo: flag propio seteado al saltar, reset al empezar a bajar.
-      // Es la forma más fiable — no depende de que Phaser preserve velocity.y
-      // en el momento exacto del callback, ni de blocked.up.
-      // Además exigimos que la llama esté DEBAJO del ladrillo (center.y > brick center).
-      const hitiendoDesdeAbajo =
-        this._subiendo &&
-        llama.body.center.y > brick.body.center.y;
-
-      if (!hitiendoDesdeAbajo) return;
-
-      const tipo = brick.getData('tipo');
-
-      if (tipo === 'trago') {
-        // Bloque "?" estilo Mario: no se rompe. Solo la PRIMERA vez que lo
-        // golpean desde abajo suelta un trago y rebota; después queda fijo,
-        // como piedra, sin volver a moverse ni reaccionar.
-        if (!brick.getData('usado')) {
-          brick.setData('usado', true);
-          this._lanzarMonedaAnim(brick.x, brick.body.top);
-          this._rebotarLadrillo(brick);
-          brick.setTexture('block_used').setDisplaySize(36, 36).refreshBody(); // queda fijo, ya sin el "?"
-        }
-        return;
-      }
-
-      if (tipo === 'moneda') {
-        // Ladrillo con hongo: la primera vez sale el hongo y camina;
-        // el ladrillo queda fijo (igual que el bloque de trago).
-        if (!brick.getData('usado')) {
-          brick.setData('usado', true);
-          this._lanzarHongo(brick.x, brick.body.top);
-          this._rebotarLadrillo(brick);
-          brick.setTexture('block_used').setDisplaySize(36, 36).refreshBody();
-        }
-        return;
-      }
-
-      if (tipo === 'flor') {
-        // Ladrillo con flor de fuego: solo la primera vez lanza el power-up.
-        if (!brick.getData('usado')) {
-          brick.setData('usado', true);
-          this._lanzarFlor(brick.x, brick.body.top);
-          this._rebotarLadrillo(brick);
-          brick.setTexture('block_used').setDisplaySize(36, 36).refreshBody();
-        }
-        return;
-      }
-
-      if (tipo === 'monedas') {
-        // Bloque ?×5: hasta 5 golpes, luego queda duro.
-        if (brick.getData('usado')) return;
-        const MAX_MONEDAS = 5;
-        const count = (brick.getData('monCount') || 0) + 1;
-        brick.setData('monCount', count);
-        this._lanzarMonedaAnim(brick.x, brick.body.top);
-        this._rebotarLadrillo(brick);
-        if (count >= MAX_MONEDAS) {
-          brick.setData('usado', true);
-          brick.setTexture('block_used').setDisplaySize(36, 36).refreshBody();
-        }
-        return;
-      }
-
-      if (tipo === 'moneda1') {
-        // Bloque ?×1: 1 golpe → 1 moneda → se endurece.
-        if (brick.getData('usado')) return;
-        brick.setData('usado', true);
-        this._lanzarMonedaAnim(brick.x, brick.body.top);
-        this._rebotarLadrillo(brick);
-        brick.setTexture('block_used').setDisplaySize(36, 36).refreshBody();
-        return;
-      }
-
-      // Ladrillo normal ('break'): explota en fragmentos, sin moneda.
-      const cx = brick.x;
-      const cy = brick.body.top;
-      [[-1,-1],[1,-1],[-1.5,-0.5],[1.5,-0.5],[-0.5,1],[0.5,1]].forEach(([dx, dy]) => {
-        const frag = this.add.image(cx, cy, 'ladrillo')
-          .setDisplaySize(16, 16)
-          .setDepth(10);
-        this.tweens.add({
-          targets:  frag,
-          x:        cx + dx * 44,
-          y:        cy + dy * 52,
-          alpha:    0,
-          angle:    dx * 280,
-          duration: 440,
-          ease:     'Power2',
-          onComplete: () => frag.destroy(),
+        // Si el nombre es largo, continúa debajo
+        wrapped.slice(1).forEach(line => {
+          pushText(`${indent}    | ${line}`);
+          push(0x0A);
         });
-      });
-      brick.destroy();
-    }, null, this);
-
-    // Colisiones con tiles de escaleras
-    this.physics.add.collider(this.llama, this.stairTiles);
-    this.physics.add.collider(this.enemies, this.stairTiles);
-
-    // Llama vs goomba: si lo pisa desde arriba, lo mata y rebota;
-    // si lo toca de costado, la llama muere.
-    // El processCallback corre ANTES de separar los cuerpos, así que ahí
-    // decidimos con la posición real de contacto (más confiable que
-    // revisarlo después, cuando Arcade Physics ya movió los sprites).
-    this.physics.add.collider(this.llama, this.enemies, (llama, goomba) => {
-      if (!goomba.active || !goomba.getData('vivo')) return;
-
-      if (goomba.getData('pisado')) {
-        this._matarGoomba(goomba);
-        llama.setVelocityY(-260);
-      } else {
-        this._takeDamage();
       }
-    }, (llama, goomba) => {
-      const pisando =
-        llama.body.velocity.y > 0 &&
-        llama.body.center.y < goomba.body.center.y;
-      goomba.setData('pisado', pisando);
-      return true;
-    }, this);
-
-    // ── CÁMARA ────────────────────────────────────────────────
-    this.cameras.main.startFollow(this.llama, true, 0.1, 1);
-
-    // ── CONTROLES TECLADO ─────────────────────────────────────
-    this.cursors  = this.input.keyboard.createCursorKeys();
-    this.spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
-    this.keyB     = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.B);
-
-    // ── CONTROLES TÁCTILES (swipe sobre el canvas, como respaldo) ──
-    this.touch = { active: false, startX: 0, startY: 0, dirX: 0, saltado: false };
-    this.input.on('pointerdown', (p) => {
-      this.touch = { active: true, startX: p.x, startY: p.y, dirX: 0, saltado: false };
-    });
-    this.input.on('pointermove', (p) => {
-      if (!this.touch.active) return;
-      const dx = p.x - this.touch.startX;
-      const dy = p.y - this.touch.startY;
-      if (Math.abs(dx) > 12) this.touch.dirX = dx > 0 ? 1 : -1;
-      if (dy < -35 && !this.touch.saltado) { this.touch.saltado = true; this._doJump(); }
-    });
-    this.input.on('pointerup', () => { this.touch.active = false; this.touch.dirX = 0; });
-
-    // ── BOTONES TÁCTILES (D-pad + salto, para celular) ─────────
-    this.mobileControls = { left: false, right: false };
-
-    // ── POOL DE BOLAS DE FUEGO ─────────────────────────────────────────────
-    // Pool de 8 slots. Se usan disableBody/enableBody (patrón oficial Phaser 3)
-    // porque incluyen body.reset() que sincroniza la posición interna del body.
-    this._createFireballTexture();
-    this._crearTexturaBrasa();
-    // textura orb ya no se genera por canvas — se usa misil.png
-    this.fireballs = this.physics.add.group();
-    for (let i = 0; i < 8; i++) {
-      const _fb = this.fireballs.create(-200, -200, 'fireball');
-      _fb.setOrigin(0.5, 0.5).setDisplaySize(20, 20);
-      _fb.body.setSize(20, 20);
-      _fb.disableBody(true, true);   // setActive(false) + setVisible(false) + body.enable=false
+      return;
     }
-    this._lastFireTime = 0;
-    // Registrar colliders una sola vez (todos los grupos ya existen aquí)
-    this._setupFireballColliders();
+    if (node.classList.contains('p-delivery-label')) {
+      push(ESC, 0x61, 0x01);
+      addTextLines(node.textContent);
+      return;
+    }
+    const childElements = [...node.children];
+    if (!childElements.length) {
+      addTextLines(node.textContent);
+      return;
+    }
+    childElements.forEach(walkComanda);
+  };
 
-    this._setupMobileButtons();
+  push(ESC, 0x40); // initialize
+  // El cierre se imprime compacto y legible: centrado y con peso fuerte.
+  push(ESC, 0x61, 0x01);
+  push(ESC, 0x45, 0x01);
+  push(GS, 0x21, 0x09);
+  walkComanda(printArea);
 
-    // ── HUD estilo Mario ──────────────────────────────────────
-    const PF = '"Press Start 2P", "Courier New", monospace';
-    const hudStyle = { fontFamily: PF, fontSize: '9px', color: '#ffffff', stroke: '#000', strokeThickness: 2 };
-    const valStyle = { fontFamily: PF, fontSize: '11px', color: '#ffffff', stroke: '#000', strokeThickness: 2 };
+  push(GS, 0x21, 0x00);
+  push(ESC, 0x45, 0x00);
+  push(ESC, 0x61, 0x00);
+  pushText('\r\n');
+  push(ESC, 0x64, 0x03); // feed
+  push(GS, 0x56, 0x00); // full cut
+  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  chunks.forEach(chunk => { bytes.set(chunk, offset); offset += chunk.length; });
+  return bytes;
+}
 
-    // ── Parche Phaser 3.90: Group.getLength() crashea con "size of undefined" ──
-    // cuando un grupo es destruido mientras el physics world todavía lo itera.
-    // Parcheamos getLength() en el prototipo del grupo para que devuelva 0
-    // en lugar de lanzar un error cuando children es undefined/null.
-    {
-      // Subir por la cadena de prototipos para encontrar donde vive getLength
-      let proto = Object.getPrototypeOf(this.enemies);
-      while (proto) {
-        if (Object.prototype.hasOwnProperty.call(proto, 'getLength') && !proto._gl390) {
-          proto._gl390 = true;
-          const _origGL = proto.getLength;
-          proto.getLength = function() {
-            if (!this.children) return 0;
-            return _origGL.call(this);
-          };
+async function buscarImpresoraUsb() {
+  if (!navigator.usb) {
+    throw new Error('WebUSB no está disponible en este navegador');
+  }
+  const dispositivos = await navigator.usb.getDevices();
+  if (dispositivos.length > 0) {
+    impresora = dispositivos[0];
+  } else {
+    impresora = await navigator.usb.requestDevice({ filters: [] });
+  }
+  if (!impresora) throw new Error('No se encontró la impresora');
+  return impresora;
+}
+
+async function enviarEscPosPorUsb(bytes) {
+  const device = await buscarImpresoraUsb();
+  let claimedInterface = null;
+  try {
+    if (!device.opened) await device.open();
+    if (device.configuration === null) {
+      await device.selectConfiguration(1);
+    }
+
+    let selectedInterface = null;
+    let selectedAlternate = null;
+    for (const iface of device.configuration.interfaces) {
+      for (const alternate of iface.alternates) {
+        if (alternate.endpoints.some(endpoint => endpoint.direction === 'out')) {
+          selectedInterface = iface;
+          selectedAlternate = alternate;
           break;
         }
-        proto = Object.getPrototypeOf(proto);
       }
+      if (selectedInterface) break;
+    }
+    if (!selectedInterface || !selectedAlternate) {
+      throw new Error('No se encontró salida USB en la Epson');
     }
 
-    // Franja oscura superior fija
-    this.add.rectangle(W / 2, 14, W, 28, 0x000000, 0.45).setScrollFactor(0).setDepth(10);
-
-    // Vidas (izquierda)
-    this.add.text(10, 5, 'LLAMA', hudStyle).setScrollFactor(0).setDepth(11);
-    this.vidas = 3;
-    this.vidasText = this.add.text(10, 15, '? ×3', valStyle).setScrollFactor(0).setDepth(11);
-
-    // Monedas (centro)
-    this.add.text(W / 2, 5, 'MONEDAS', hudStyle).setOrigin(0.5, 0).setScrollFactor(0).setDepth(11);
-    this.tragos = 0;
-    this.tragoText = this.add.text(W / 2, 15, '🪙 ×0', valStyle).setOrigin(0.5, 0).setScrollFactor(0).setDepth(11);
-
-    // Mundo (derecha)
-    this.add.text(W - 10, 5, 'MUNDO', hudStyle).setOrigin(1, 0).setScrollFactor(0).setDepth(11);
-    this.add.text(W - 10, 15, '1-1', valStyle).setOrigin(1, 0).setScrollFactor(0).setDepth(11);
-  }
-
-  // ── Hitbox de la llama según estado de poder ─────────────────────────
-  // Se llama al crear la llama y cada vez que cambia de forma.
-  // Coordenadas locales (pre-escala): setSize/setOffset trabajan en espacio local.
-  _applyLlamaHitbox() {
-    if (this._powerState === 'capa') {
-      // Frame capa: 369 × 674 px — fondo ya transparente, personaje centrado
-      const FW = 369, FH = 674;
-      const bW = Math.round(FW * 0.50);   // 50% del ancho (cuerpo visible)
-      const bH = Math.round(FH * 0.80);   // 80% de la altura (ignora zona superior)
-      this.llama.body.setSize(bW, bH);
-      this.llama.body.setOffset(
-        (FW - bW) / 2,          // centrado horizontal
-        FH * 0.18               // baja el tope del hitbox (ignora cabeza/cuello vacíos)
-      );
-    } else {
-      // Frame normal/small: idle/walk/jump ≈ 464 × 848 px
-      const FW = 464, FH = 848;
-      const bW = Math.round(FW * 0.50);   // 50% del ancho
-      const bH = Math.round(FH * 0.80);   // 80% de la altura
-      this.llama.body.setSize(bW, bH);
-      this.llama.body.setOffset(
-        (FW - bW) / 2,          // centrado horizontal
-        FH * 0.18               // ignora espacio transparente superior
+    await device.claimInterface(selectedInterface.interfaceNumber);
+    claimedInterface = selectedInterface.interfaceNumber;
+    if (selectedAlternate.alternateSetting !== 0) {
+      await device.selectAlternateInterface(
+        selectedInterface.interfaceNumber,
+        selectedAlternate.alternateSetting
       );
     }
-  }
+    const endpointOut = selectedAlternate.endpoints.find(endpoint => endpoint.direction === 'out');
+    if (!endpointOut) throw new Error('No se encontró USB OUT en la Epson');
 
-  // ── Cambia el estado de poder de la llama ─────────────────────────────
-  // 'small' → 'normal' (come moneda) → 'capa' (come flor de fuego)
-  _setPowerState(newState) {
-    this._powerState = newState;
-
-    if (newState === 'normal') {
-      // Crece de pequeña a tamaño normal
-      this.tweens.add({
-        targets: this.llama,
-        scaleX: LLAMA_SCALE,
-        scaleY: LLAMA_SCALE,
-        duration: 280,
-        ease: 'Back.easeOut',
-      });
-      // Flash de crecimiento
-      this.tweens.add({ targets: this.llama, alpha: 0, duration: 70, yoyo: true, repeat: 3 });
+    /*
+     * Android puede truncar una transferencia grande al adaptador USB de la
+     * Epson. Enviar paquetes de tamaño de endpoint y esperar entre ellos
+     * evita que falte la parte inferior de la comanda.
+     */
+    const packetSize = Math.max(8, Math.min(endpointOut.packetSize || 64, 64));
+    for (let offset = 0; offset < bytes.length; offset += packetSize) {
+      const packet = bytes.slice(offset, offset + packetSize);
+      const result = await device.transferOut(endpointOut.endpointNumber, packet);
+      if (result.status && result.status !== 'ok') {
+        throw new Error(`La Epson rechazó los datos USB (${result.status})`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 12));
     }
-
-    if (newState === 'capa') {
-      // Transforma a forma capa: flash dorado + crece un poco más
-      const IDLE_CAPA = this.textures.get('quietocapa').getFrameNames()[0];
-      this.tweens.add({
-        targets: this.llama,
-        alpha: 0,
-        duration: 60,
-        yoyo: true,
-        repeat: 5,
-        onComplete: () => {
-          // Cambia textura a capa y ajusta escala
-          this.llama.setTexture('quietocapa', IDLE_CAPA);
-          this.llama.setScale(LLAMA_SCALE_CAPA);
-          this._state = 'idle';
-          // Actualizar hitbox para el frame capa
-          this._applyLlamaHitbox();
-        }
-      });
+    // Dar tiempo al buffer USB/impresora antes de liberar la interfaz.
+    await new Promise(resolve => setTimeout(resolve, Math.max(800, bytes.length * 2)));
+  } finally {
+    if (claimedInterface !== null) {
+      try { await device.releaseInterface(claimedInterface); } catch (_) {}
     }
-
-    // Siempre actualiza el hitbox al cambiar estado (excepto capa que lo hace en onComplete)
-    if (newState !== 'capa') this._applyLlamaHitbox();
-  }
-
-  // ── Sistema de daño estilo Super Mario Bros ───────────────────────────
-  // capa → normal → small → muere
-  // Al recibir daño hay ~2 s de invencibilidad con parpadeo.
-  _takeDamage() {
-    // No hacer nada si ya hay invencibilidad activa o la llama está muriendo
-    if (this._invincible || this._dying) return;
-
-    if (this._powerState === 'capa') {
-      // Pierde flor de fuego → vuelve a forma normal
-      this._powerState = 'normal';
-      // Cancelar tweens activos de la llama (escala, alpha de transformación)
-      this.tweens.killTweensOf(this.llama);
-      this.llama.setTexture('idle', this.IDLE_FRAME);
-      this.llama.setScale(LLAMA_SCALE);
-      this._state = 'idle';
-      this._applyLlamaHitbox();
-      this._startInvincibility();
-
-    } else if (this._powerState === 'normal') {
-      // Pierde hongo → vuelve a forma pequeña
-      this._powerState = 'small';
-      this.tweens.killTweensOf(this.llama);
-      this.llama.setScale(LLAMA_SCALE_SMALL);
-      this._applyLlamaHitbox();
-      this._startInvincibility();
-
-    } else {
-      // Ya es pequeña → muere
-      this._respawn();
-    }
-  }
-
-  // Activa ~2 s de invencibilidad con parpadeo visual (igual que Mario).
-  _startInvincibility() {
-    this._invincible = true;
-    this._playHurtSound();
-    this.tweens.killTweensOf(this.llama);
-    this.tweens.add({
-      targets:  this.llama,
-      alpha:    0.2,
-      duration: 80,
-      yoyo:     true,
-      repeat:   13,            // 80 ms × 2 × 14 ≈ 2240 ms de parpadeo
-      ease:     'Linear',
-      onComplete: () => {
-        this.llama.setAlpha(1);
-        this._invincible = false;
-      },
-    });
-  }
-
-  // Sonido de golpe sintetizado (descendente rápido, estilo Mario hurt).
-  _playHurtSound() {
-    try {
-      const ctx = this.sound.context;
-      if (!ctx || ctx.state === 'suspended') return;
-      const t = ctx.currentTime;
-      [[600, 0.00, 0.09], [400, 0.09, 0.09], [250, 0.18, 0.14]].forEach(([freq, offset, dur]) => {
-        const osc  = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain); gain.connect(ctx.destination);
-        osc.type = 'square';
-        osc.frequency.setValueAtTime(freq, t + offset);
-        gain.gain.setValueAtTime(0.18, t + offset);
-        gain.gain.exponentialRampToValueAtTime(0.001, t + offset + dur);
-        osc.start(t + offset); osc.stop(t + offset + dur + 0.02);
-      });
-    } catch (e) {}
-  }
-
-  // ── Lanza la flor de fuego desde el ladrillo ──────────────────────────
-  // Sale hacia arriba, cae al piso y espera a que la llama la toque.
-  _lanzarFlor(brickX, brickTopY) {
-    const flor = this.physics.add.image(brickX, brickTopY, 'flordefuego');
-    flor.setOrigin(0.5, 1)
-        .setDisplaySize(48, 48)
-        .setDepth(9);
-    flor.setGravityY(500);
-    flor.setCollideWorldBounds(true);
-    // Sale disparada hacia arriba, camina a la derecha
-    flor.setVelocityY(-260);
-    flor.setVelocityX(110);
-
-    // Colisión con piso
-    this.floorBodies.forEach(fb => this.physics.add.collider(flor, fb));
-    this.physics.add.collider(flor, this.bricks);
-    this.physics.add.collider(flor, this.stairTiles);
-
-    // Rebota en tubos
-    this.physics.add.collider(flor, this.tubes, () => {
-      flor.setVelocityX(-flor.body.velocity.x);
-    });
-
-    // Llama la recoge → se transforma en capa
-    this.physics.add.overlap(this.llama, flor, () => {
-      if (!flor.active) return;
-      flor.destroy();
-      if (this.sonidoMoneda) this.sonidoMoneda.play();
-      // Solo si está en estado normal o small
-      if (this._powerState !== 'capa') {
-        this._setPowerState('capa');
-      }
-    });
-  }
-
-  // Pequeño rebote visual del ladrillo golpeado (no se rompe).
-  _rebotarLadrillo(brick) {
-    if (brick.getData('rebotando')) return;
-    brick.setData('rebotando', true);
-    const baseY = brick.y;
-    this.tweens.add({
-      targets: brick,
-      y: baseY - 8,
-      duration: 70,
-      yoyo: true,
-      ease: 'Quad.easeOut',
-      onComplete: () => {
-        brick.setData('rebotando', false);
-        brick.body.updateFromGameObject();
-      },
-    });
-  }
-
-  // Sale una moneda del ladrillo y suma al contador.
-  _darTrago(x, y) {
-    const trago = this.add.text(x, y, '🪙', { fontSize: '22px' }).setOrigin(0.5, 1).setDepth(10);
-    this.tweens.add({
-      targets: trago,
-      y: y - 46,
-      alpha: 0,
-      duration: 550,
-      ease: 'Cubic.easeOut',
-      onComplete: () => trago.destroy(),
-    });
-
-    this.tragos += 1;
-    this.tragoText.setText(`🪙 x${this.tragos}`);
-  }
-
-  // Moneda pequeña que salta hacia arriba y desaparece (como Mario).
-  _lanzarMonedaAnim(x, y) {
-    const m = this.add.image(x, y - 4, 'moneda_small')
-      .setOrigin(0.5, 1).setDepth(12).setDisplaySize(22, 22);
-    // Sube rápido y luego cae un poco antes de desaparecer
-    this.tweens.add({
-      targets: m,
-      y: y - 72,
-      alpha: 0,
-      duration: 500,
-      ease: 'Cubic.easeOut',
-      onComplete: () => m.destroy(),
-    });
-    this.tragos += 1;
-    this.tragoText.setText(`🪙 x${this.tragos}`);
-    if (this.sonidoMoneda) this.sonidoMoneda.play();
-  }
-
-  // Saca el hongo del ladrillo: sale disparado hacia arriba,
-  // cae al piso y camina hacia la derecha (igual que el hongo de Mario).
-  // Al chocar con un tubo rebota a la izquierda; si la llama lo toca lo recoge.
-  _lanzarHongo(brickX, brickTopY) {
-    const primerFrame = this.textures.get('moneda').getFrameNames()[0];
-
-    const hongo = this.physics.add.sprite(brickX, brickTopY, 'moneda', primerFrame);
-    hongo.setOrigin(0.5, 1)
-         .setDisplaySize(72, 72)
-         .setDepth(9);
-
-    hongo.setGravityY(500);
-    hongo.setCollideWorldBounds(true);
-
-    // Sale disparado hacia arriba y empieza caminando a la derecha
-    hongo.setVelocityY(-260);
-    hongo.setVelocityX(110);
-
-    // Animación en loop infinito
-    hongo.play({ key: 'moneda_giro', repeat: -1 });
-
-    // ── Piso ──
-    this.floorBodies.forEach(fb => {
-      this.physics.add.collider(hongo, fb);
-    });
-
-    // ── Ladrillos y tiles ──
-    this.physics.add.collider(hongo, this.bricks);
-    this.physics.add.collider(hongo, this.stairTiles);
-
-    // ── Tubos: rebota invirtiendo dirección ──
-    this.physics.add.collider(hongo, this.tubes, () => {
-      const vx = hongo.body.velocity.x;
-      hongo.setVelocityX(-vx);          // invierte horizontal
-      hongo.setFlipX(hongo.flipX);      // ya está flipped por la anim
-    });
-
-    // ── Llama lo recoge: crece si estaba pequeña ──
-    this.physics.add.overlap(this.llama, hongo, () => {
-      if (!hongo.active) return;
-      hongo.destroy();
-      if (this.sonidoMoneda) this.sonidoMoneda.play();
-      // Si la llama es pequeña, crece a tamaño normal al comer la moneda
-      if (this._powerState === 'small') {
-        this._setPowerState('normal');
-      }
-    });
-
-    if (this.sonidoMoneda) this.sonidoMoneda.play();
-  }
-
-  // Crea un goomba en `x`, sobre el piso, caminando en dirección `dir`
-  // (1 = derecha, -1 = izquierda).
-  _crearGoomba(x, dir) {
-    const g = this.enemies.create(x, GROUND_Y - 10, 'goomba', 'ezgif-frame-028_pixian_ai.png');
-    g.setOrigin(0.5, 1);
-    g.setScale(GOOMBA_SCALE);
-    g.setCollideWorldBounds(true);
-    g.setData('dir', dir);
-    g.setData('vivo', true);
-
-    // Hitbox local (pre-escala). Frame real: 674×369 px, personaje centrado
-    // y apoyado en la base del frame (igual que el atlas del elefante).
-    const G_W = 674, G_H = 369;
-    const bodyLocalW  = Math.round(G_W * 0.6);
-    const bodyLocalH  = G_H;
-    const bodyOffsetX = (G_W - bodyLocalW) / 2;
-    const bodyOffsetY = 0;
-    g.body.setSize(bodyLocalW, bodyLocalH);
-    g.body.setOffset(bodyOffsetX, bodyOffsetY);
-
-    g.play('goomba_caminar');
-    g.setVelocityX(dir * GOOMBA_SPEED);
-    g.setFlipX(dir < 0);
-    return g;
-  }
-
-  // Mata al goomba (lo pisaron desde arriba): se detiene, hace un pequeño
-  // "aplastón" visual y desaparece.
-  _matarGoomba(goomba) {
-    if (!goomba.getData('vivo')) return;
-    goomba.setData('vivo', false);
-    goomba.body.setVelocity(0, 0);
-    goomba.body.enable = false;
-    goomba.anims.stop();
-
-    this.tweens.add({
-      targets: goomba,
-      scaleY: goomba.scaleY * 0.2,
-      y: goomba.y + 6,
-      alpha: 0,
-      duration: 220,
-      ease: 'Quad.easeIn',
-      onComplete: () => goomba.destroy(),
-    });
-  }
-
-  // Conecta los botones HTML con el juego.
-  // stopPropagation evita que el canvas reciba el mismo touch y interfiera.
-  _setupMobileButtons() {
-    const btnLeft  = document.getElementById('btn-left');
-    const btnRight = document.getElementById('btn-right');
-    const btnJump  = document.getElementById('btn-jump');
-    const btnUp    = document.getElementById('btn-up');
-    const btnDown  = document.getElementById('btn-down');
-    const btnStart = document.getElementById('btn-start');
-    if (!btnLeft || !btnRight || !btnJump) return;
-
-    const bind = (el, onDown, onUp) => {
-      if (!el) return;
-      const down = (e) => { e.preventDefault(); e.stopPropagation(); el.classList.add('is-active'); onDown(); };
-      const up   = (e) => { e.preventDefault(); e.stopPropagation(); el.classList.remove('is-active'); onUp && onUp(); };
-      el.addEventListener('touchstart', down, { passive: false });
-      el.addEventListener('touchend',   up,   { passive: false });
-      el.addEventListener('touchcancel', up,  { passive: false });
-      el.addEventListener('mousedown', down);
-      el.addEventListener('mouseup',   up);
-      el.addEventListener('mouseleave', up);
-    };
-
-    bind(btnLeft,
-      () => { this.mobileControls.left = true; },
-      () => { this.mobileControls.left = false; });
-
-    bind(btnRight,
-      () => { this.mobileControls.right = true; },
-      () => { this.mobileControls.right = false; });
-
-    bind(btnJump, () => {
-      if (this._titleActive) { this._menuConfirm && this._menuConfirm(); }
-      else { this._doJump(); }
-    });
-
-    // ↑ ↓ navegan el menú del título (en juego no hacen nada por ahora)
-    bind(btnUp,   () => { this._menuMove && this._menuMove(-1); });
-    bind(btnDown, () => { this._menuMove && this._menuMove(1); });
-
-    // START confirma la opción seleccionada en el menú
-    bind(btnStart, () => { this._menuConfirm && this._menuConfirm(); });
-
-    // Botón B: lanzar bola de fuego (solo activo con Flor de Fuego)
-    const btnFire = document.getElementById('btn-fire');
-    bind(btnFire, () => { this._dispararBola(); });
-    if (btnFire) btnFire.classList.add('ctrl-b--disabled'); // empieza desactivado
-
-    // Si la escena se reinicia/destruye, evitamos referencias colgantes.
-    this.events.once('shutdown', () => {
-      this.mobileControls.left  = false;
-      this.mobileControls.right = false;
-      this._menuMove    = null;
-      this._menuConfirm = null;
-    });
-
-    // ── Overlay de título directamente en GameScene ───────────
-    // Así el mundo se ve de fondo sin problemas de transparencia
-    this._titleActive = true;
-    this.physics.world.pause();   // congela enemigos, elefante y llama
-    this.llama.body.allowGravity = false;
-    this.llama.setVelocity(0, 0);
-
-    const imgW = Math.round(W * 0.56);
-    const imgH = Math.round(imgW * (1024 / 1536));
-    const _tImg = this.add.image(W / 2, H / 2 - 22, 'aniversario')
-      .setDisplaySize(imgW, imgH).setScrollFactor(0).setDepth(200);
-
-    const _tBar = this.add.rectangle(W / 2, H - 52, W, 80, 0x000000, 0.70)
-      .setScrollFactor(0).setDepth(200);
-
-    const PF = '"Press Start 2P", "Courier New", monospace';
-
-    // Opciones del menú: 0 = TRIVIA, 1 = DEMO
-    let _sel = 1;  // JUGAR DEMO seleccionado por defecto
-
-    const OPT_Y   = [H - 74, H - 44];
-    const OPT_LBL = ['GÁNATE UNA MESA TRIVIA', 'JUGAR DEMO'];
-    const OPT_SZ  = ['10px', '13px'];
-
-    const _tOpt1 = this.add.text(W / 2, OPT_Y[0], OPT_LBL[0],
-      { fontFamily: PF, fontSize: OPT_SZ[0], color: '#ffffff', stroke: '#000', strokeThickness: 3 }
-    ).setOrigin(0.5).setScrollFactor(0).setDepth(201).setInteractive({ useHandCursor: true });
-
-    const _tOpt2 = this.add.text(W / 2, OPT_Y[1], OPT_LBL[1],
-      { fontFamily: PF, fontSize: OPT_SZ[1], color: '#FFD700', stroke: '#000', strokeThickness: 3 }
-    ).setOrigin(0.5).setScrollFactor(0).setDepth(201).setInteractive({ useHandCursor: true });
-
-    const _opts = [_tOpt1, _tOpt2];
-
-    const _tArrow = this.add.text(0, 0, '▶',
-      { fontFamily: PF, fontSize: '12px', color: '#FFD700' }
-    ).setOrigin(0.5).setScrollFactor(0).setDepth(201);
-    this.tweens.add({ targets: _tArrow, alpha: 0, duration: 380, yoyo: true, repeat: -1 });
-
-    // Actualiza colores y posición de la flecha según selección
-    const _updateSel = () => {
-      _opts.forEach((t, i) => t.setColor(i === _sel ? '#FFD700' : '#ffffff'));
-      const tgt = _opts[_sel];
-      _tArrow.setPosition(tgt.x - tgt.width / 2 - 18, tgt.y);
-    };
-    _updateSel();
-
-    const _startGame = () => {
-      if (!this._titleActive) return;
-      this._titleActive  = false;
-      this._menuMove     = null;
-      this._menuConfirm  = null;
-      // Guardar modo seleccionado en el registry para usarlo al final
-      this.registry.set('modoJuego', _sel === 0 ? 'trivia' : 'demo');
-      this.physics.world.resume();
-      this.llama.body.allowGravity = true;
-      [_tImg, _tBar, _tOpt1, _tOpt2, _tArrow].forEach(o => o.destroy());
-      this.input.keyboard.off('keydown', _kbHandler);
-    };
-
-    // Navegar con ↑ ↓ del teclado o botones móviles
-    const _kbHandler = (e) => {
-      if (e.key === 'ArrowUp'   || e.key === 'w') { this._menuMove(-1); return; }
-      if (e.key === 'ArrowDown' || e.key === 's') { this._menuMove(1);  return; }
-      _startGame();
-    };
-
-    // Callbacks expuestos a los botones móviles
-    this._menuMove = (dir) => {
-      _sel = (_sel + dir + 2) % 2;
-      _updateSel();
-    };
-    this._menuConfirm = _startGame;
-
-    _tOpt1.on('pointerdown', () => { _sel = 0; _startGame(); });
-    _tOpt2.on('pointerdown', () => { _sel = 1; _startGame(); });
-    this.input.keyboard.on('keydown', _kbHandler);
-  }
-
-  // ═══════════════════════════════════════════════════════════════
-  //  SISTEMA DE BOSS — ELEFANTE
-  // ═══════════════════════════════════════════════════════════════
-
-  // Crea la barra de HP del boss (se llama la primera vez que recibe daño)
-  _crearBarraElefante() {
-    if (this._bossBar) return;
-    const PF = '"Press Start 2P", "Courier New", monospace';
-    this._bossBarBg = this.add.rectangle(W / 2, H - 14, 200, 14, 0x000000, 0.65)
-      .setScrollFactor(0).setDepth(20);
-    this._bossLabel = this.add.text(W / 2 - 96, H - 20, '🐘', { fontSize: '10px' })
-      .setScrollFactor(0).setDepth(21);
-    this._bossBar = this.add.rectangle(W / 2 - 74, H - 14, 140, 7, 0xff2222)
-      .setScrollFactor(0).setDepth(21).setOrigin(0, 0.5);
-  }
-
-  _actualizarBarraElefante() {
-    if (!this._bossBar) return;
-    const pct = Math.max(0, this._elefanteHP) / 3;
-    this.tweens.add({ targets: this._bossBar, width: 140 * pct, duration: 180 });
-  }
-
-  // El elefante recibe un pisotón desde arriba
-  _elefanteRecibirGolpe() {
-    if (this._elefanteInvincible || !this.elefante || !this.elefante.active) return;
-
-    this._elefanteHP--;
-    this._playStompElephantSound();
-
-    // Flash rojo
-    this._elefanteInvincible = true;
-    this.elefante.setTint(0xff4444);
-    this.time.delayedCall(140, () => {
-      if (this.elefante && this.elefante.active) this.elefante.clearTint();
-    });
-
-    if (this._elefanteHP <= 0) {
-      this._elefanteMuere();
-      return;
-    }
-
-    // Aturdimiento: se detiene, parpadea y retoma la caminata
-    this._elefanteState = 'aturdido';
-    this.elefante.setVelocity(0, 0);
-    // Parpadeo rápido durante el aturdimiento
-    this.tweens.add({
-      targets: this.elefante, alpha: 0.25,
-      duration: 90, yoyo: true, repeat: 4,
-      onComplete: () => {
-        if (this.elefante && this.elefante.active) this.elefante.setAlpha(1);
-      },
-    });
-    this.time.delayedCall(720, () => {
-      if (!this.elefante || !this.elefante.active) return;
-      this.elefante.clearTint();
-      this._elefanteInvincible = false;
-      this._elefanteState = 'caminar';
-      this.elefante.play('elefante_caminar');
-    });
-  }
-
-  // ─── Stun por pisotón ────────────────────────────────────────
-  _elefanteAturdirPorPison() {
-    if (!this.elefante || !this.elefante.active || this._elefanteMuerto) return;
-    if (this._elefanteState === 'aturdido') return;
-    this._playStompElephantSound();
-    this._elefanteState      = 'aturdido';
-    this._elefanteInvincible = false;   // sigue siendo vulnerable al fuego
-    this.elefante.setVelocity(0, 0);
-    this.elefante.setTint(0xffee00);    // amarillo = aturdido
-
-    // Estrellas orbitando sobre la cabeza del elefante
-    const stars = [];
-    for (let i = 0; i < 3; i++) {
-      const s = this.add.text(0, 0, '⭐', { fontSize: '13px' })
-        .setOrigin(0.5).setDepth(16);
-      stars.push({ obj: s, phase: (i / 3) * Math.PI * 2 });
-    }
-    let elapsed = 0;
-    const starTick = this.time.addEvent({
-      delay: 16, loop: true,
-      callback: () => {
-        if (!this.elefante || !this.elefante.active) return;
-        elapsed += 16;
-        stars.forEach(({ obj, phase }) => {
-          const a = phase + elapsed * 0.005;
-          obj.x = this.elefante.x + Math.cos(a) * 28;
-          obj.y = this.elefante.y - 80 + Math.sin(a) * 8;
-        });
-      },
-    });
-
-    this.time.delayedCall(2200, () => {
-      starTick.destroy();
-      stars.forEach(({ obj }) => { try { obj.destroy(); } catch(e){} });
-      if (!this.elefante || !this.elefante.active || this._elefanteMuerto) return;
-      this.elefante.clearTint();
-      this._elefanteState = 'caminar';
-      this.elefante.play('elefante_caminar');
-    });
-  }
-
-  // ─── Misil del elefante: usa misil.png, viaja horizontal puro ───────
-  _lanzarBolaElefante() {
-    if (!this.elefante || !this.elefante.active || this._elefanteMuerto) return;
-    if (this._elefanteState === 'aturdido') return;
-    if (!this.llama || this._dying) return;
-
-    // Contador para alternar altura (0=bajo, 1=medio, 2=alto, luego repite)
-    if (this._misilCount === undefined) this._misilCount = 0;
-    const alturas = [-20, -60, -110];   // relativo al centro del elefante
-    const offsetY = alturas[this._misilCount % alturas.length];
-    this._misilCount++;
-
-    // Dirección hacia la llama
-    const dir = Math.sign(this.llama.x - this.elefante.x) || 1;
-
-    // Nace en la boca/trompa del elefante, altura varía según contador
-    const startX = this.elefante.x + dir * 70;
-    const startY = this.elefante.y + offsetY;
-
-    // La imagen es 1536×1024 → mostramos a 96×64 px (mantiene proporción 3:2)
-    const misil = this.physics.add.image(startX, startY, 'misil')
-      .setDisplaySize(96, 64)
-      .setOrigin(0.5, 0.5)
-      .setDepth(9)
-      .setFlipX(dir < 0);          // voltea la imagen si va hacia la izquierda
-
-    // Agregar al grupo PRIMERO — Phaser resetea el body al hacer add(),
-    // cualquier propiedad puesta antes se pierde
-    this.bolasElefante.add(misil);
-
-    // Ahora sí configurar el body (después del add, no antes)
-    misil.body.setSize(80, 58);
-    misil.body.setOffset(8, 3);
-    misil.body.allowGravity = false;   // SIN GRAVEDAD — viaje completamente horizontal
-    misil.body.setVelocityX(dir * 220);
-    misil.body.setVelocityY(0);
-
-    // Estela de fuego en la cola del misil
-    const trailTimer = this.time.addEvent({
-      delay: 40,
-      loop: true,
-      callback: () => {
-        if (!misil || !misil.active || !misil.scene) { trailTimer.remove(false); return; }
-        const brasa = this.add.image(misil.x - dir * 40, misil.y + 5, 'brasa')
-          .setDisplaySize(18, 18).setAlpha(0.85).setDepth(8);
-        this.tweens.add({
-          targets: brasa, alpha: 0, scaleX: 2.5, scaleY: 2.5,
-          duration: 180, onComplete: () => brasa.destroy(),
-        });
-      },
-    });
-
-    // Auto-destruir tras 5 s si no impacta nada
-    this.time.delayedCall(5000, () => {
-      trailTimer.remove(false);
-      if (misil && misil.scene) misil.destroy();
-    });
-  }
-
-  _elefanteMuere() {
-    if (!this.elefante || !this.elefante.active || this._elefanteMuerto) return;
-    this._elefanteMuerto = true;   // bloquear update() y timers
-
-    // Detener timer de orbes y limpiar orbes en vuelo
-    if (this._bolaTimer) { this._bolaTimer.remove(); this._bolaTimer = null; }
-    this.bolasElefante.getChildren().slice().forEach(r => { try { r.destroy(); } catch(e){} });
-
-    this.elefante.body.enable = false;
-    this.elefante.anims.stop();
-    this.elefante.setTint(0xff4400);
-
-    const ex = this.elefante.x;   // capturar posición antes de tweens/destroy
-    const lavaY = GROUND_Y + 10;
-    this.tweens.add({
-      targets:  this.elefante,
-      y:        lavaY,
-      duration: 750,
-      ease:     'Quad.easeIn',
-      onComplete: () => {
-        // Salpicadura de lava al entrar
-        for (let i = 0; i < 8; i++) {
-          const sx  = ex + Phaser.Math.Between(-50, 50);
-          const dot = this.add.rectangle(sx, lavaY, 7, 7, 0xFF4400).setDepth(12);
-          this.tweens.add({
-            targets: dot,
-            y: dot.y - Phaser.Math.Between(25, 70),
-            x: dot.x + Phaser.Math.Between(-30, 30),
-            alpha: 0, duration: Phaser.Math.Between(300, 650),
-            ease: 'Quad.easeOut',
-            onComplete: () => dot.destroy(),
-          });
-        }
-        // Se hunde y desaparece
-        this.tweens.add({
-          targets:  this.elefante,
-          y:        lavaY + 80,
-          scaleX:   this.elefante.scaleX * 0.4,
-          alpha:    0,
-          duration: 420,
-          ease:     'Linear',
-          onComplete: () => { try { this.elefante.destroy(); } catch(e){} },
-        });
-      },
-    });
-
-    // Desvanece la barra de boss
-    this.time.delayedCall(250, () => {
-      const bars = [this._bossBar, this._bossBarBg, this._bossLabel].filter(Boolean);
-      if (bars.length) {
-        this.tweens.add({
-          targets: bars, alpha: 0, duration: 500,
-          onComplete: () => bars.forEach(b => { try { b.destroy(); } catch(e){} }),
-        });
-      }
-    });
-
-    // Victoria: guardar, sonido, luego arrancar caminata al castillo
-    this.time.delayedCall(450, () => {
-      this._playVictorySound();
-      guardarPartida(
-        this.registry.get('nombreJugador') || 'Anónimo',
-        this.tragos || 0,
-        'gano'
-      );
-      this._iniciarSecuenciaVictoria();
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════════════
-  //  SECUENCIA DE VICTORIA — llama camina al castillo y entra
-  // ═══════════════════════════════════════════════════════════════
-  _iniciarSecuenciaVictoria() {
-    // Bloquear todo input del jugador
-    this._winSequence = true;
-
-    // Detener música de fondo
-    if (this.musicaFondo && this.musicaFondo.isPlaying) this.musicaFondo.stop();
-
-    // La llama queda libre de física (la moveremos con un tween)
-    this.llama.body.enable = false;
-    this.llama.setVelocity(0, 0);
-    // Llevar la llama al frente para que pase DELANTE del castillo
-    this.llama.setDepth(10);
-
-    // Orientar la llama hacia la derecha
-    this.llama.setFlipX(false);
-
-    // Reproducir animación de caminar según el estado de poder actual
-    const walkAnim = this._powerState === 'capa' ? 'caminar_capa' : 'caminar';
-    this.llama.play(walkAnim, true);
-
-    // Anclar llama al suelo (por si saltó durante el combate)
-    const llamaFloorY = GROUND_Y - 10;
-    this.llama.y = llamaFloorY;
-
-    // ── Extender límites del mundo para que la cámara llegue al castillo ──
-    const CASTLE_WALK_END = (this._levelEndX || 8556) + 900;
-    this.physics.world.setBounds(0, 0, CASTLE_WALK_END, H + 600);
-    this.cameras.main.setBounds(0, 0, CASTLE_WALK_END, H);
-
-    // ── Colocar el castillo a la derecha ──────────────────────────────────
-    const CASTLE_X      = (this._levelEndX || 8556) + 500;
-    const CASTLE_H_DISP = 210;           // alto en pantalla (px) — tamaño reducido
-    const CASTLE_W_DISP = Math.round(504 / 495 * CASTLE_H_DISP);  // ≈ 215 px
-    const CASTLE_Y      = GROUND_Y;      // base toca el suelo
-
-    // Depth 3 = detrás de la llama (llama usa depth por defecto ~0 pero
-    // renderiza sobre objetos estáticos; la ponemos explícitamente adelante)
-    const castle = this.add.image(CASTLE_X, CASTLE_Y, 'castillo')
-      .setOrigin(0.5, 1)
-      .setDisplaySize(CASTLE_W_DISP, CASTLE_H_DISP)
-      .setDepth(3)
-      .setAlpha(0);
-
-    // El castillo aparece con un pequeño fade-in mientras la llama se acerca
-    this.tweens.add({ targets: castle, alpha: 1, duration: 600, delay: 400 });
-
-    // ── Nubes decorativas para el camino al castillo ───────────────────────
-    const extraClouds = [
-      [this._levelEndX + 120, 60, 0.16, 0.3],
-      [this._levelEndX + 320, 40, 0.13, 0.25],
-      [this._levelEndX + 550, 75, 0.18, 0.28],
-      [this._levelEndX + 750, 50, 0.14, 0.22],
-    ];
-    extraClouds.forEach(([cx, cy, sc, sf]) => {
-      this.add.image(cx, cy, 'nube').setScale(sc).setScrollFactor(sf).setDepth(-1);
-    });
-
-    // ── Piso visible hasta el castillo ────────────────────────────────────
-    const walkW  = CASTLE_X + CASTLE_W_DISP / 2 - (this._levelEndX || 8556);
-    const walkCX = (this._levelEndX || 8556) + walkW / 2;
-    const walkCY = H - PISO_H / 2;
-    this.add.rectangle(walkCX, walkCY, walkW, PISO_H, 0x9B5E1A).setDepth(1);
-    const tileScaleY = PISO_H / 268;
-    this.add.tileSprite(walkCX, walkCY, walkW, PISO_H, 'suelooriginal')
-      .setTileScale(tileScaleY, tileScaleY).setDepth(2);
-
-    // ── Cielo azul de vuelta para el tramo final ──────────────────────────
-    this.cameras.main.setBackgroundColor('#5C94FC');
-
-    // ── Música de nivel completado ────────────────────────────────────────
-    try {
-      if (this.cache.audio.exists('completado')) {
-        const sndCompletado = this.sound.add('completado', { loop: false, volume: 0.7 });
-        sndCompletado.play();
-      }
-    } catch(e) {}
-
-    // ── La llama camina automáticamente hacia la puerta del castillo ──────
-    // La "puerta" está aproximadamente en el centro-inferior del castillo
-    const DOOR_X   = CASTLE_X - 20;   // ligeramente a la izquierda del centro
-    const walkDist = DOOR_X - this.llama.x;
-    const walkTime = Math.max(2000, walkDist / 140 * 1000);   // ~140 px/s
-
-    this.tweens.add({
-      targets: this.llama,
-      x: DOOR_X,
-      y: llamaFloorY,
-      duration: walkTime,
-      ease: 'Linear',
-      onComplete: () => this._llamaEntraCastillo(castle),
-    });
-  }
-
-  // La llama llega a la puerta y "entra" al castillo
-  _llamaEntraCastillo(castle) {
-    // Efecto de entrada: llama se achica y desaparece dentro del castillo
-    this.tweens.add({
-      targets: this.llama,
-      scaleX: 0,
-      scaleY: 0,
-      alpha: 0,
-      duration: 350,
-      ease: 'Quad.easeIn',
-      onComplete: () => {
-        try { this.llama.setVisible(false); } catch(e) {}
-        this._mostrarPantallaGanaste();
-      },
-    });
-  }
-
-  // Pantalla final: GANASTE con confeti y botón WhatsApp grande
-  _mostrarPantallaGanaste() {
-    const PF = '"Press Start 2P", "Courier New", monospace';
-
-    // Mensaje pre-escrito en el chat de WhatsApp al abrir el link
-    const WA_LINK = 'https://wa.me/59175296941?text=Quiero%20reclamar%20mi%20mesa%20trivia';
-
-    const COLORS = [0xFFD700, 0xFF4444, 0x44FF88, 0x44AAFF, 0xFF88FF, 0xFF8800];
-
-    // ── Overlay oscuro ────────────────────────────────────────────
-    const overlay = this.add.rectangle(W / 2, H / 2, W, H, 0x050510, 0)
-      .setScrollFactor(0).setDepth(600);
-
-    this.tweens.add({
-      targets: overlay, fillAlpha: 0.88, duration: 500,
-      onComplete: () => {
-
-        // ── ¡GANASTE! ─────────────────────────────────────────────
-        const win = this.add.text(W / 2, 40, '¡GANASTE!', {
-          fontFamily: PF, fontSize: '38px', color: '#FFD700',
-          stroke: '#000', strokeThickness: 8,
-          shadow: { offsetX: 0, offsetY: 0, color: '#FFD700', blur: 18, fill: true },
-        }).setOrigin(0.5).setScrollFactor(0).setDepth(615).setAlpha(0);
-        this.tweens.add({ targets: win, alpha: 1, y: 54, duration: 560, ease: 'Back.easeOut' });
-
-        // ── Subtítulo ─────────────────────────────────────────────
-        const sub = this.add.text(W / 2, 100,
-          '¡Derrotaste al elefante!',
-          { fontFamily: PF, fontSize: '11px', color: '#ccffcc', stroke: '#000', strokeThickness: 3 }
-        ).setOrigin(0.5).setScrollFactor(0).setDepth(615).setAlpha(0);
-        this.tweens.add({ targets: sub, alpha: 1, duration: 400, delay: 300 });
-
-        // ── Caja del premio ───────────────────────────────────────
-        const prizeBox = this.add.rectangle(W / 2, 170, W - 40, 90, 0x0a0a00)
-          .setStrokeStyle(4, 0xFFD700).setScrollFactor(0).setDepth(611).setAlpha(0);
-        this.tweens.add({ targets: prizeBox, alpha: 1, duration: 350, delay: 450 });
-
-        const prizeLabel = this.add.text(W / 2, 152,
-          '🏆  ¡GANASTE UNA MESA TRIVIA!  🏆',
-          { fontFamily: PF, fontSize: '13px', color: '#FFD700', stroke: '#000', strokeThickness: 4 }
-        ).setOrigin(0.5).setScrollFactor(0).setDepth(616).setAlpha(0);
-        this.tweens.add({ targets: prizeLabel, alpha: 1, duration: 350, delay: 500 });
-        this.tweens.add({ targets: prizeLabel, alpha: 0.55, yoyo: true, repeat: -1, duration: 850, delay: 1100 });
-
-        const prizeInstr = this.add.text(W / 2, 187,
-          'Ingresá al link y reclamá tu mesa',
-          { fontFamily: PF, fontSize: '9px', color: '#ffffff', stroke: '#000', strokeThickness: 2 }
-        ).setOrigin(0.5).setScrollFactor(0).setDepth(616).setAlpha(0);
-        this.tweens.add({ targets: prizeInstr, alpha: 1, duration: 350, delay: 580 });
-
-        // ── Botón WhatsApp — GRANDE para celu ─────────────────────
-        const btnY = 285;
-        const btnW = W - 60;   // casi todo el ancho del canvas
-        const btnH = 72;
-
-        // Sombra
-        this.add.rectangle(W / 2 + 4, btnY + 5, btnW, btnH, 0x000000, 0.55)
-          .setScrollFactor(0).setDepth(611);
-
-        // Fondo amarillo
-        const btnBg = this.add.rectangle(W / 2, btnY, btnW, btnH, 0xFFD700)
-          .setStrokeStyle(3, 0xa08000).setScrollFactor(0).setDepth(612).setAlpha(0)
-          .setInteractive({ useHandCursor: true });
-        this.tweens.add({ targets: btnBg, alpha: 1, duration: 400, delay: 750 });
-
-        // Línea superior brillante (efecto 3D)
-        const btnShine = this.add.rectangle(W / 2, btnY - btnH / 2 + 6, btnW - 6, 6, 0xffffff, 0.28)
-          .setScrollFactor(0).setDepth(613).setAlpha(0);
-        this.tweens.add({ targets: btnShine, alpha: 1, duration: 400, delay: 750 });
-
-        const btnTxt = this.add.text(W / 2, btnY,
-          '💬  RECLAMAR MI MESA',
-          { fontFamily: PF, fontSize: '14px', color: '#000000',
-            stroke: '#806000', strokeThickness: 2 }
-        ).setOrigin(0.5).setScrollFactor(0).setDepth(614).setAlpha(0);
-        this.tweens.add({ targets: btnTxt, alpha: 1, duration: 400, delay: 750 });
-
-        const btnSub = this.add.text(W / 2, btnY + 24,
-          'Abrir WhatsApp →',
-          { fontFamily: PF, fontSize: '8px', color: '#333300', stroke: '#806000', strokeThickness: 2 }
-        ).setOrigin(0.5).setScrollFactor(0).setDepth(614).setAlpha(0);
-        this.tweens.add({ targets: btnSub, alpha: 1, duration: 400, delay: 850 });
-
-        // Pulso de atención en el botón
-        this.tweens.add({
-          targets: [btnBg, btnTxt, btnSub, btnShine],
-          scaleX: 1.025, scaleY: 1.025,
-          yoyo: true, repeat: -1, duration: 750, delay: 1400,
-          ease: 'Sine.easeInOut',
-        });
-
-        btnBg.on('pointerover',  () => { btnBg.setFillStyle(0xFFE840); });
-        btnBg.on('pointerout',   () => { btnBg.setFillStyle(0xFFD700); });
-        btnBg.on('pointerdown',  () => {
-          btnBg.setFillStyle(0xcc9900);
-          btnBg.setScale(0.97); btnTxt.setScale(0.97); btnSub.setScale(0.97);
-        });
-        btnBg.on('pointerup', () => {
-          btnBg.setFillStyle(0xFFD700);
-          btnBg.setScale(1); btnTxt.setScale(1); btnSub.setScale(1);
-          window.open(WA_LINK, '_blank');
-        });
-
-        // ── Texto reinicio ────────────────────────────────────────
-        const restart = this.add.text(W / 2, H - 18,
-          'El juego se reinicia en unos segundos...',
-          { fontFamily: PF, fontSize: '6px', color: '#666688', stroke: '#000', strokeThickness: 1 }
-        ).setOrigin(0.5).setScrollFactor(0).setDepth(615).setAlpha(0);
-        this.tweens.add({ targets: restart, alpha: 1, duration: 400, delay: 1500 });
-
-        // ── Confeti ───────────────────────────────────────────────
-        const spawnConfeti = (count, delayBase) => {
-          for (let i = 0; i < count; i++) {
-            const col = COLORS[i % COLORS.length];
-            const cx  = Phaser.Math.Between(30, W - 30);
-            const sy  = Phaser.Math.Between(-50, 60);
-            const dot = this.add.rectangle(cx, sy,
-              Phaser.Math.Between(6, 14), Phaser.Math.Between(5, 11), col)
-              .setScrollFactor(0).setDepth(609);
-            this.tweens.add({
-              targets: dot,
-              y: sy + Phaser.Math.Between(220, 520),
-              x: cx + Phaser.Math.Between(-100, 100),
-              angle: Phaser.Math.Between(-720, 720),
-              alpha: 0,
-              duration: Phaser.Math.Between(1000, 2600),
-              delay: delayBase + Phaser.Math.Between(0, 600),
-              ease: 'Quad.easeIn',
-              onComplete: () => dot.destroy(),
-            });
-          }
-        };
-        spawnConfeti(60, 0);
-        this.time.delayedCall(1300, () => spawnConfeti(40, 0));
-        this.time.delayedCall(3000, () => spawnConfeti(30, 0));
-
-        // ── Reiniciar ─────────────────────────────────────────────
-        this.time.delayedCall(14000, () => {
-          this.physics.world.colliders.destroy();
-          this.physics.world.pause();
-          this.scene.restart();
-        });
-      },
-    });
-  }
-
-  // Sonido de golpe al elefante: thud grave + chasquido agudo
-  _playStompElephantSound() {
-    try {
-      const ctx = this.sound.context;
-      if (!ctx || ctx.state === 'suspended') return;
-      const t = ctx.currentTime;
-      // Golpe grave
-      const o1 = ctx.createOscillator(); const g1 = ctx.createGain();
-      o1.connect(g1); g1.connect(ctx.destination);
-      o1.type = 'sine';
-      o1.frequency.setValueAtTime(160, t);
-      o1.frequency.exponentialRampToValueAtTime(42, t + 0.30);
-      g1.gain.setValueAtTime(0.55, t);
-      g1.gain.exponentialRampToValueAtTime(0.001, t + 0.36);
-      o1.start(t); o1.stop(t + 0.40);
-      // Chasquido agudo encima
-      const o2 = ctx.createOscillator(); const g2 = ctx.createGain();
-      o2.connect(g2); g2.connect(ctx.destination);
-      o2.type = 'square';
-      o2.frequency.setValueAtTime(820, t);
-      o2.frequency.exponentialRampToValueAtTime(200, t + 0.08);
-      g2.gain.setValueAtTime(0.22, t);
-      g2.gain.exponentialRampToValueAtTime(0.001, t + 0.10);
-      o2.start(t); o2.stop(t + 0.12);
-    } catch(e) {}
-  }
-
-  // Fanfarria de victoria ascendente
-  _playVictorySound() {
-    try {
-      const ctx = this.sound.context;
-      if (!ctx || ctx.state === 'suspended') return;
-      const t = ctx.currentTime;
-      [
-        [523,0.00,0.12],[659,0.13,0.12],[784,0.26,0.12],
-        [1047,0.39,0.35],[784,0.74,0.10],[1047,0.84,0.55],
-      ].forEach(([f,s,d]) => {
-        const o = ctx.createOscillator(); const g = ctx.createGain();
-        o.connect(g); g.connect(ctx.destination);
-        o.type = 'square';
-        o.frequency.setValueAtTime(f, t + s);
-        g.gain.setValueAtTime(0.20, t + s);
-        g.gain.exponentialRampToValueAtTime(0.001, t + s + d);
-        o.start(t + s); o.stop(t + s + d + 0.02);
-      });
-    } catch(e) {}
-  }
-
-  // ═══════════════════════════════════════════════════════════════
-
-  _respawn() {
-    if (this._dying) return;   // evita doble llamada
-    this._dying = true;
-
-    // Limpiar bolas de fuego en vuelo
-    if (this.fireballs) {
-      this.fireballs.getChildren().forEach(fb => {
-        if (fb.active) this._destroyFireball(fb);
-      });
-    }
-
-    // Detener música
-    if (this.musicaFondo && this.musicaFondo.isPlaying) this.musicaFondo.stop();
-
-    // Sonido de muerte sintetizado (estilo Mario)
-    this._playDeathSound();
-
-    // Congelar física — solo la llama hace su animación de muerte
-    this.physics.world.pause();
-    this.llama.body.enable = false;
-    this.llama.anims.stop();
-
-    const startY = this.llama.y;
-
-    // ① Sube un poco  →  ② Cae fuera de pantalla  →  ③ Pantalla de vidas
-    this.tweens.add({
-      targets: this.llama,
-      y: startY - 150,
-      duration: 420,
-      ease: 'Sine.easeOut',
-      onComplete: () => {
-        this.tweens.add({
-          targets: this.llama,
-          y: H + 180,
-          duration: 680,
-          ease: 'Sine.easeIn',
-          onComplete: () => this._mostrarPantallaVidas(),
-        });
-      },
-    });
-  }
-
-  _mostrarPantallaVidas() {
-    this.vidas = Math.max(0, this.vidas - 1);
-    this.vidasText.setText(`? ×${this.vidas}`);
-
-    // Fondo negro con fade
-    const overlay = this.add.rectangle(W / 2, H / 2, W, H, 0x000000)
-      .setScrollFactor(0).setDepth(500).setAlpha(0);
-
-    this.tweens.add({
-      targets: overlay, alpha: 1, duration: 450,
-      onComplete: () => {
-        const PF = '"Press Start 2P", "Courier New", monospace';
-
-        if (this.vidas <= 0) {
-          // GAME OVER → guardar en Supabase, luego reiniciar
-          guardarPartida(
-            this.registry.get('nombreJugador') || 'Anónimo',
-            this.tragos || 0,
-            'perdio'
-          );
-          this.add.text(W / 2, H / 2, 'GAME OVER',
-            { fontFamily: PF, fontSize: '28px', color: '#ffffff' }
-          ).setOrigin(0.5).setScrollFactor(0).setDepth(501);
-          this.time.delayedCall(2800, () => {
-            // Limpiar todos los colliders antes de reiniciar
-            // para evitar "Cannot read properties of undefined (reading 'size')"
-            this.physics.world.colliders.destroy();
-            this.physics.world.pause();
-            this.scene.restart();
-          });
-
-        } else {
-          // Muestra llama × vidas restantes, luego continúa el juego
-          const txt1 = this.add.text(W / 2, H / 2 - 36, 'LLAMA',
-            { fontFamily: PF, fontSize: '16px', color: '#FFD700' }
-          ).setOrigin(0.5).setScrollFactor(0).setDepth(501);
-          const txt2 = this.add.text(W / 2, H / 2 + 14, `\u00D7  ${this.vidas}`,
-            { fontFamily: PF, fontSize: '24px', color: '#ffffff' }
-          ).setOrigin(0.5).setScrollFactor(0).setDepth(501);
-
-          // setTimeout nativo: garantizado sin depender de Phaser timer/tween
-          this._respawnTimer = setTimeout(() => {
-            // Destruir overlay negro Y los textos
-            try { overlay.destroy(); } catch(e) {}
-            try { txt1.destroy(); } catch(e) {}
-            try { txt2.destroy(); } catch(e) {}
-
-
-            // Fade-from-black usando la cámara (no depende de tweens ni timers de Phaser)
-            this.cameras.main.fadeFrom(450, 0, 0, 0);
-            this.cameras.main.setBackgroundColor('#5C94FC');
-            this._skyStart = undefined;
-
-            // Resetear llama al inicio del nivel — vuelve a forma pequeña
-            this._powerState = 'small';
-            this.llama.setTexture('idle', this.IDLE_FRAME);
-            this.llama.setScale(LLAMA_SCALE_SMALL);
-            this._applyLlamaHitbox();
-            this.llama.setVisible(true);
-            this.llama.setPosition(80, GROUND_Y - 10);
-            this.llama.setVelocity(0, 0);
-            this.llama.body.enable = true;
-            this._subiendo = false;
-            this._state    = 'idle';
-
-            // Reanudar juego
-            this.physics.world.resume();
-            if (this.musicaFondo && !this.musicaFondo.isPlaying) this.musicaFondo.play();
-            this._dying = false;
-          }, 2500);
-        }
-      },
-    });
-  }
-
-  _playDeathSound() {
-    try {
-      const ctx = this.sound.context;
-      if (!ctx) return;
-      const t = ctx.currentTime;
-      // Secuencia descendente estilo Mario muerte
-      [
-        [494, 0.00, 0.12],
-        [370, 0.12, 0.12],
-        [311, 0.24, 0.12],
-        [330, 0.36, 0.16],
-        [277, 0.52, 0.16],
-        [294, 0.68, 0.16],
-        [247, 0.84, 0.55],
-      ].forEach(([freq, start, dur]) => {
-        const osc  = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.type = 'square';
-        osc.frequency.setValueAtTime(freq, t + start);
-        gain.gain.setValueAtTime(0.22, t + start);
-        gain.gain.exponentialRampToValueAtTime(0.001, t + start + dur);
-        osc.start(t + start);
-        osc.stop(t + start + dur + 0.05);
-      });
-    } catch (e) { /* silencioso si el audio no está listo */ }
-  }
-
-  _doJump() {
-    if (this.llama.body.blocked.down) {
-      this.llama.setVelocityY(-530);
-      this._subiendo   = true;
-      this._jumpHeldMs = 0;      // reinicia contador de tiempo mantenido
-      this.llama.play(this._powerState === 'capa' ? 'saltar_capa' : 'saltar');
-      if (this.sonidoSalto) this.sonidoSalto.play();
-    }
-  }
-
-  update() {
-    // Mientras el título está activo, no procesar controles
-    if (this._titleActive) return;
-    // Durante la secuencia de victoria, bloquear todo input
-    if (this._winSequence) return;
-
-    // ── Transición de cielo: azul → negro al acercarse al boss ──
-    if (this._skyStart !== undefined) {
-      const t = Phaser.Math.Clamp(
-        (this.llama.x - this._skyStart) / (this._skyEnd - this._skyStart), 0, 1
-      );
-      // Sunset: azul → naranja → magenta → púrpura oscuro (en vez de negro)
-      let r, g, b;
-      if (t < 0.40) {
-        const s = t / 0.40;
-        r = Math.round(0x5C + (0xFF - 0x5C) * s);
-        g = Math.round(0x94 + (0x60 - 0x94) * s);
-        b = Math.round(0xFC + (0x10 - 0xFC) * s);
-      } else if (t < 0.75) {
-        const s = (t - 0.40) / 0.35;
-        r = Math.round(0xFF + (0xB0 - 0xFF) * s);
-        g = Math.round(0x60 + (0x18 - 0x60) * s);
-        b = Math.round(0x10 + (0x60 - 0x10) * s);
-      } else {
-        const s = (t - 0.75) / 0.25;
-        r = Math.round(0xB0 + (0x20 - 0xB0) * s);
-        g = Math.round(0x18 + (0x06 - 0x18) * s);
-        b = Math.round(0x60 + (0x35 - 0x60) * s);
-      }
-      this.cameras.main.setBackgroundColor(
-        '#' + r.toString(16).padStart(2,'0') + g.toString(16).padStart(2,'0') + b.toString(16).padStart(2,'0')
-      );
-    }
-
-    // ── Muerte por caída en hueco ─────────────────────────────
-    if (this.llama.y > H + 80) {
-      this._respawn();
-      return;
-    }
-
-    // ── Detección misil→llama (manual, independiente de hitboxes) ──
-    this._checkMisiles();
-
-    const onGround  = this.llama.body.blocked.down;
-
-    // Resetear flag de subida cuando la llama empieza a bajar o toca suelo
-    if (this._subiendo && (this.llama.body.velocity.y >= 0 || onGround)) {
-      this._subiendo = false;
-    }
-
-    const moveLeft  = this.cursors.left.isDown  || this.touch.dirX === -1 || this.mobileControls.left;
-    const moveRight = this.cursors.right.isDown || this.touch.dirX ===  1 || this.mobileControls.right;
-    const jumpNow   =
-      Phaser.Input.Keyboard.JustDown(this.spaceKey) ||
-      Phaser.Input.Keyboard.JustDown(this.cursors.up);
-
-    if      (moveLeft)  { this.llama.setVelocityX(-230); this.llama.setFlipX(true);  }
-    else if (moveRight) { this.llama.setVelocityX( 230); this.llama.setFlipX(false); }
-    else                { this.llama.setVelocityX(0); }
-
-    if (jumpNow) this._doJump();
-
-    // ── Disparo de bola de fuego (tecla B) ─────────────────────────────────
-    if (Phaser.Input.Keyboard.JustDown(this.keyB)) this._dispararBola();
-
-    // ── Estado visual del botón B (activo solo con Flor de Fuego) ──────────
-    const _btnF = document.getElementById('btn-fire');
-    if (_btnF) _btnF.classList.toggle('ctrl-b--disabled', this._powerState !== 'capa');
-
-    // ── Trail y detección de impacto lateral / salida de pantalla ───────────
-    this.fireballs.getChildren().forEach(fb => {
-      if (!fb.active) return;
-
-      // Matar bolas que salen de los límites del mundo (caen en huecos entre
-      // plataformas, vuelan demasiado lejos, etc.). Esto libera el slot
-      // inmediatamente sin esperar el timer de 1.8 s.
-      if (fb.y > H + 80 || fb.x < -150 || fb.x > WORLD_W + 150) {
-        this._destroyFireball(fb);
-        return;
-      }
-
-      // Impacto lateral contra pared → explota
-      if (fb.body.blocked.left || fb.body.blocked.right) {
-        this._explotar(fb.x, fb.y);
-        this._destroyFireball(fb);
-        return;
-      }
-
-      // Estela de fuego: chispa pequeña cada ~3 frames
-      if (Phaser.Math.Between(0, 2) === 0) {
-        const brasa = this.add.image(fb.x, fb.y, 'brasa')
-          .setDisplaySize(10, 10).setAlpha(0.75).setDepth(7);
-        this.tweens.add({
-          targets: brasa, alpha: 0, scaleX: 2.5, scaleY: 2.5,
-          duration: 145, onComplete: () => brasa.destroy(),
-        });
-      }
-    });
-
-    // ── Comportamiento del elefante boss ──────────────────────────
-    if (this.elefante && this.elefante.active && !this._dying && !this._elefanteMuerto) {
-
-      // Esquivar bolas de fuego: si viene una, salta para evitarla
-      if (this._elefanteState === 'caminar' && this.elefante.body.blocked.down) {
-        const incoming = this.fireballs.getChildren().find(fb => {
-          if (!fb.active || !fb.body) return false;
-          const dist    = Math.abs(fb.x - this.elefante.x);
-          const heading = (fb.body.velocity.x > 0 && fb.x < this.elefante.x) ||
-                          (fb.body.velocity.x < 0 && fb.x > this.elefante.x);
-          return dist < 190 && heading;
-        });
-        if (incoming) {
-          this._elefanteState = 'saltar';
-          this.elefante.play('elefante_saltar');
-          this.elefante.setVelocityX(0);
-          this.elefante.setVelocityY(-430);
-        }
-      }
-
-      // Patrulla normal (solo estado 'caminar')
-      if (this._elefanteState === 'caminar') {
-        if (this.elefante.x <= this._elefanteXIzq) this._elefanteDir = 1;
-        else if (this.elefante.x >= this._elefanteXDer) this._elefanteDir = -1;
-        this.elefante.setVelocityX(this._elefanteDir * this._elefanteSpeed);
-        this.elefante.setFlipX(this._elefanteDir > 0);
-      }
-      // 'saltar' / 'aturdido': física libre / sin movimiento horizontal propio
-    }
-
-    // ── Patrulla de los goombas: dan la vuelta al chocar o al llegar al borde ──
-    const EDGE = 36; // margen en px antes del borde para girar
-    this.enemies.children.each((g) => {
-      if (!g.active || !g.getData('vivo')) return;
-      // Detección de borde: buscar en qué segmento de piso está el goomba
-      const seg = this._floorSegs.find(([x1, x2]) => g.x >= x1 - 10 && g.x <= x2 + 10);
-      if (seg) {
-        const [x1, x2] = seg;
-        if (g.getData('dir') === 1 && g.x >= x2 - EDGE) {
-          g.setData('dir', -1);
-          g.setFlipX(true);
-        } else if (g.getData('dir') === -1 && g.x <= x1 + EDGE) {
-          g.setData('dir', 1);
-          g.setFlipX(false);
-        }
-      }
-      // También girar al chocar con tubo u obstáculo
-      if (g.body.blocked.right || g.body.blocked.left) {
-        const nuevaDir = g.body.blocked.right ? -1 : 1;
-        g.setData('dir', nuevaDir);
-        g.setFlipX(nuevaDir < 0);
-      }
-      g.setVelocityX(g.getData('dir') * GOOMBA_SPEED);
-    });
-
-    // ── Animaciones ──────────────────────────────────────────
-    // La animación a usar depende del estado de poder (normal vs capa).
-    const esCapa = this._powerState === 'capa';
-    const CAPA_IDLE_FRAME = esCapa ? this.textures.get('quietocapa').getFrameNames()[0] : null;
-
-    if (!onGround) {
-      if (this._state !== 'saltar') {
-        this._state = 'saltar';
-        this.llama.play(esCapa ? 'saltar_capa' : 'saltar');
-      }
-    } else if (moveLeft || moveRight) {
-      if (this._state !== 'caminar') {
-        this._state = 'caminar';
-        this.llama.play(esCapa ? 'caminar_capa' : 'caminar');
-      }
-    } else {
-      if (this._state !== 'idle') {
-        this._state = 'idle';
-        this.llama.anims.stop();
-        if (esCapa) {
-          this.llama.setTexture('quietocapa', CAPA_IDLE_FRAME);
-        } else {
-          this.llama.setTexture('idle', this.IDLE_FRAME);
-        }
-      }
-    }
-  }
-
-  // ══════════════════════════════════════════════════════════════════════════
-  //  SISTEMA DE BOLAS DE FUEGO
-  // ══════════════════════════════════════════════════════════════════════════
-
-  /** Genera la textura canvas de las bolas de fuego (glow radial naranja/blanco). */
-  _createFireballTexture() {
-    const sz = 20;
-    const c  = document.createElement('canvas');
-    c.width = c.height = sz;
-    const ctx = c.getContext('2d');
-    const grd = ctx.createRadialGradient(sz/2, sz/2, 1, sz/2, sz/2, sz/2);
-    grd.addColorStop(0,    '#FFFFFF');
-    grd.addColorStop(0.22, '#FFFF88');
-    grd.addColorStop(0.55, '#FF6600');
-    grd.addColorStop(1,    'rgba(255,40,0,0)');
-    ctx.fillStyle = grd;
-    ctx.beginPath();
-    ctx.arc(sz/2, sz/2, sz/2, 0, Math.PI * 2);
-    ctx.fill();
-    if (this.textures.exists('fireball')) this.textures.remove('fireball');
-    this.textures.addCanvas('fireball', c);
-  }
-
-  // _crearTexturaOrbElefante eliminado — se usa misil.png
-
-  /** Genera textura para brasas/chispas del trail y explosiones. */
-  _crearTexturaBrasa() {
-    const sz = 8;
-    const c  = document.createElement('canvas');
-    c.width = c.height = sz;
-    const ctx = c.getContext('2d');
-    const grd = ctx.createRadialGradient(sz/2, sz/2, 0, sz/2, sz/2, sz/2);
-    grd.addColorStop(0,   'rgba(255,220,80,1)');
-    grd.addColorStop(0.5, 'rgba(255,80,0,0.75)');
-    grd.addColorStop(1,   'rgba(255,40,0,0)');
-    ctx.fillStyle = grd;
-    ctx.beginPath();
-    ctx.arc(sz/2, sz/2, sz/2, 0, Math.PI * 2);
-    ctx.fill();
-    if (this.textures.exists('brasa')) this.textures.remove('brasa');
-    this.textures.addCanvas('brasa', c);
-  }
-
-  /** Registra todos los colliders de las bolas de fuego con el mundo. */
-  _setupFireballColliders() {
-    // Rebote en piso (cada segmento físico).
-    // NOTA: Phaser puede invertir los args (a, b) cuando el piso es un Rectangle
-    // estático; _rebotar detecta cuál de los dos es la bola mediante contains().
-    this.floorBodies.forEach(floor =>
-      this.physics.add.collider(this.fireballs, floor, (a, b) => this._rebotar(a, b))
-    );
-    // Rebote en escaleras y tiles (como en Super Mario)
-    this.physics.add.collider(this.fireballs, this.stairTiles, (a, b) => this._rebotar(a, b));
-    // Helper: identifica cuál de los dos args del callback pertenece al grupo fireballs.
-    // Phaser puede invertir el orden cuando uno de los objetos es estático.
-    const _getBall = (a, b) =>
-      (a && this.fireballs.contains(a)) ? a
-      : (b && this.fireballs.contains(b)) ? b
-      : null;
-
-    // Desaparece al tocar tubos
-    this.physics.add.collider(this.fireballs, this.tubes, (a, b) => {
-      const ball = _getBall(a, b);
-      if (!ball || !ball.active) return;
-      this._explotar(ball.x, ball.y);
-      this._destroyFireball(ball);
-    });
-    // Desaparece al tocar ladrillos
-    this.physics.add.collider(this.fireballs, this.bricks, (a, b) => {
-      const ball = _getBall(a, b);
-      if (!ball || !ball.active) return;
-      this._explotar(ball.x, ball.y);
-      this._destroyFireball(ball);
-    });
-    // Mata a los goombas
-    this.physics.add.overlap(this.fireballs, this.enemies, (a, b) => {
-      const ball   = _getBall(a, b);
-      const goomba = (ball === a) ? b : a;
-      if (!ball || !ball.active) return;
-      if (!goomba || !goomba.active || !goomba.getData('vivo')) return;
-      const bx = ball.x, by = ball.y;
-      this._destroyFireball(ball);
-      this._explotar(bx, by);
-      this._playImpactSound();
-      this._matarGoomba(goomba);
-      this.tragos += 1;
-      this.tragoText.setText(`🪙 x${this.tragos}`);
-    });
-    // Bola de fuego impacta al elefante → lo daña (boss 3 HP)
-    this.physics.add.overlap(this.fireballs, this.elefante, (a, b) => {
-      const ball = _getBall(a, b);
-      if (!ball || !ball.active) return;
-      if (!this.elefante || !this.elefante.active) return;
-      this._explotar(ball.x, ball.y);
-      this._destroyFireball(ball);
-      this._playImpactSound();
-      this._elefanteRecibirGolpe();
-    });
-  }
-
-  /**
-   * Dispara una bola de fuego desde la posición de la llama.
-   * Solo actúa si _powerState === 'capa' (Flor de Fuego recogida).
-   * Usa el patrón oficial Phaser 3: enableBody(true, x, y, true, true)
-   * que llama body.reset() internamente → sincroniza posición, borra
-   * velocidades residuales y evita colisiones fantasma en el primer frame.
-   */
-  _dispararBola() {
-    if (this._powerState !== 'capa') return;
-
-    const now = this.time.now;
-    if (now - this._lastFireTime < 380) return;   // cooldown: 1 bola cada 380 ms
-    this._lastFireTime = now;
-
-    // Buscar bola inactiva en el pool (máx 8 en vuelo simultáneo)
-    const fb = this.fireballs.getFirstDead(false);
-    if (!fb) return;
-
-    const dir  = this.llama.flipX ? -1 : 1;
-    const spawnX = this.llama.x + dir * 28;
-    const spawnY = this.llama.y - 38;
-
-    // enableBody(reset, x, y, enableGameObject, showGameObject)
-    // reset=true → body.reset(x,y) limpia estado interno del body antes de reusar
-    fb.enableBody(true, spawnX, spawnY, true, true);
-    fb.setAlpha(1).setAngle(0).setDepth(8);
-    fb.setData('bounces', 0);
-    fb.setData('lastBounce', 0);
-    fb.setData('dir', dir);
-
-    // Velocidad inicial: diagonal hacia adelante y ligeramente arriba
-    fb.body.setVelocity(dir * 280, -210);
-
-    // Rotación continua para efecto "bola giratoria"
-    this.tweens.killTweensOf(fb);
-    this.tweens.add({
-      targets: fb, angle: dir > 0 ? 360 : -360,
-      duration: 380, repeat: -1, ease: 'Linear',
-    });
-
-    // Auto-destruir si supera 1.8 s de vida (libera el slot rápido).
-    // El ID del timer se almacena en la bola para cancelarlo si muere antes.
-    const lifeTimer = this.time.delayedCall(1800, () => {
-      if (fb.active && fb.getData('timerId') === lifeTimer) {
-        this._explotar(fb.x, fb.y);
-        this._destroyFireball(fb);
-      }
-    });
-    fb.setData('timerId', lifeTimer);
-
-    // Micro-squeeze en la llama: sensación visual de lanzamiento
-    const sc = LLAMA_SCALE_CAPA;
-    this.tweens.add({
-      targets: this.llama,
-      scaleX: sc * 1.18, scaleY: sc * 0.84,
-      duration: 70, yoyo: true, ease: 'Power2',
-    });
-
-    this._playFireSound();
-  }
-
-  /**
-   * Devuelve una bola al pool usando disableBody(true, true) — patrón oficial
-   * Phaser 3 para object pools con arcade physics.
-   */
-  _destroyFireball(fb) {
-    if (!fb || !fb.active) return;
-    this.tweens.killTweensOf(fb);
-    // Cancelar timer de vida para que no mate el slot cuando se reutilice
-    const timer = fb.getData('timerId');
-    if (timer) { timer.remove(false); fb.setData('timerId', null); }
-    // disableBody(disableGameObject, hideGameObject) → body.enable=false + setActive(false) + setVisible(false)
-    fb.disableBody(true, true);
-  }
-
-  /**
-   * Lógica de rebote estilo Super Mario Bros:
-   * cada rebote es más bajo que el anterior (amortiguación del 38%).
-   * Tras 5 rebotes la bola desaparece con explosión.
-   *
-   * Recibe (a, b) desde el collider — Phaser puede invertir el orden
-   * cuando el piso es un Rectangle estático, así que detectamos cuál
-   * de los dos pertenece al grupo fireballs.
-   */
-  _rebotar(a, b) {
-    // Identificar cuál argumento es la bola de fuego
-    const ball = (a && this.fireballs.contains(a)) ? a
-               : (b && this.fireballs.contains(b)) ? b
-               : null;
-    if (!ball || !ball.active || !ball.body || !ball.body.enable) return;
-
-    const now = this.time.now;
-    if (now - (ball.getData('lastBounce') || 0) < 80) return;  // debounce por frame
-    ball.setData('lastBounce', now);
-
-    const bounces = (ball.getData('bounces') || 0) + 1;
-    ball.setData('bounces', bounces);
-
-    if (bounces >= 5) {
-      this._explotar(ball.x, ball.y);
-      this._destroyFireball(ball);
-      return;
-    }
-
-    const dir = ball.getData('dir') || 1;
-
-    // Rebotes más altos y suaves
-    const vy = -250 * Math.pow(0.82, bounces);
-    const vx = 280 * Math.pow(0.88, bounces);
-
-    ball.body.setVelocityX(dir * vx);
-    ball.body.setVelocityY(vy);
-  }
-
-  // Detección manual misil→llama: compara X e Y visualmente.
-  // Solo hace daño si el rectángulo del misil se solapa con el cuerpo de la llama.
-  _checkMisiles() {
-    if (!this.bolasElefante || this._dying || this._invincible) return;
-
-    // Rango horizontal de la llama (mitad del ancho visible)
-    const lx      = this.llama.x;
-    const lHalfW  = this.llama.displayWidth  * 0.40;
-
-    // Rango vertical de la llama:
-    // llama.y = base de los pies (origin 0.5,1), el cuerpo sube desde ahí.
-    // Se ignora ~15% superior (zona transparente del sprite).
-    const lBottom = this.llama.y;
-    const lTop    = lBottom - this.llama.displayHeight * 0.85;
-
-    this.bolasElefante.getChildren().forEach(orb => {
-      if (!orb || !orb.active || !orb.scene) return;
-
-      // ── Check X ──────────────────────────────────────────────
-      if (Math.abs(orb.x - lx) > lHalfW + orb.displayWidth * 0.45) return;
-
-      // ── Check Y ──────────────────────────────────────────────
-      // orb tiene origin (0.5,0.5), su cuerpo ocupa ±45% de su alto.
-      const orbHalfH  = orb.displayHeight * 0.45;
-      const orbTop    = orb.y - orbHalfH;
-      const orbBottom = orb.y + orbHalfH;
-      if (orbBottom < lTop || orbTop > lBottom) return; // pasa por encima o debajo
-
-      // ── Impacto ───────────────────────────────────────────────
-      const bx = orb.x, by = orb.y;
-      orb.destroy();
-      this._explotar(bx, by);
-      this._takeDamage();
-    });
-  }
-
-  /** Animación de explosión de fuego al impactar (8 chispas + flash central). */
-  _explotar(x, y) {
-    for (let i = 0; i < 8; i++) {
-      const angle = (i / 8) * Math.PI * 2;
-      const sp = this.add.image(x, y, 'brasa')
-        .setDisplaySize(11, 11).setAlpha(1).setDepth(12);
-      this.tweens.add({
-        targets: sp,
-        x: x + Math.cos(angle) * 34,
-        y: y + Math.sin(angle) * 34,
-        alpha: 0, scaleX: 0.2, scaleY: 0.2,
-        duration: 260, ease: 'Power2',
-        onComplete: () => sp.destroy(),
-      });
-    }
-    const flash = this.add.image(x, y, 'fireball')
-      .setDisplaySize(24, 24).setAlpha(0.95).setDepth(13);
-    this.tweens.add({
-      targets: flash, scaleX: 3.6, scaleY: 3.6, alpha: 0,
-      duration: 210, ease: 'Power1',
-      onComplete: () => flash.destroy(),
-    });
-  }
-
-  /** Sonido sintetizado de disparo (sawtooth retro descendente). */
-  _playFireSound() {
-    try {
-      const ctx = this.sound.context;
-      if (!ctx || ctx.state === 'suspended') return;
-      const t   = ctx.currentTime;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain); gain.connect(ctx.destination);
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(920, t);
-      osc.frequency.exponentialRampToValueAtTime(190, t + 0.15);
-      gain.gain.setValueAtTime(0.13, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.19);
-      osc.start(t); osc.stop(t + 0.22);
-    } catch(e) {}
-  }
-
-  /** Sonido sintetizado de impacto (ruido blanco breve). */
-  _playImpactSound() {
-    try {
-      const ctx = this.sound.context;
-      if (!ctx || ctx.state === 'suspended') return;
-      const t   = ctx.currentTime;
-      const len = Math.ceil(ctx.sampleRate * 0.09);
-      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-      const d   = buf.getChannelData(0);
-      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * 0.28;
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      const gain = ctx.createGain();
-      src.connect(gain); gain.connect(ctx.destination);
-      gain.gain.setValueAtTime(0.38, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
-      src.start(t);
-    } catch(e) {}
+    try { if (device.opened) await device.close(); } catch (_) {}
   }
 }
 
-// ─────────────────────────────────────────────────────
-//  Config y arranque
-// ─────────────────────────────────────────────────────
-const config = {
-  type: Phaser.AUTO,
-  width:  W,
-  height: H,
-  parent: 'game-container',
-  scale: {
-    mode: Phaser.Scale.FIT,
-    autoCenter: Phaser.Scale.CENTER_BOTH,
-    width:  W,
-    height: H,
-  },
-  physics: {
-    default: 'arcade',
-    arcade: { gravity: { y: 800 }, debug: false },
-  },
-  scene: [PreloadScene, NameScene, TitleScene, GameScene],
-};
+function crearDatosComanda(metodoPago, ordenNumero, productos, sesion, fecha = new Date(), nota = '') {
+  const caja = sesion?.caja || 'Sin caja';
+  return {
+    barra: (() => {
+      const numeroCaja = String(caja).toLowerCase().replace(/[^0-9]/g, '');
+      if (numeroCaja === '3') return 'BARRA VIP';
+      if (numeroCaja === '4') return 'BARRA CHOLET';
+      return 'BARRA PRINCIPAL';
+    })(),
+    orden: ordenNumero ? `#${String(ordenNumero).padStart(2, '0')}` : '',
+    pago: metodoPago || '—',
+    caja: formatReceiptCaja(caja),
+    fecha: formatReceiptDateTime(fecha),
+    nota: String(nota || '').trim(),
 
-new Phaser.Game(config);
+    productos: (Array.isArray(productos) ? productos : [])
+      .map(item => ({
+        cantidad: item.qty ?? item.cantidad ?? 0,
+        nombre: item.name ?? item.nombre ?? 'Producto'
+      }))
+      .filter(item => item.nombre && Number(item.cantidad) > 0)
+  };
+}
+
+function productNameLines(name, width = 27) {
+  return wrapUsbText(name, width);
+}
+
+function buildEscPosVentaComanda(comanda) {
+  if (!comanda || !comanda.productos?.length) {
+    throw new Error('La comanda no tiene productos para imprimir');
+  }
+
+  /*
+   * IMPORTANTE: las comandas de productos deben usar exactamente el mismo
+   * generador que el cierre de caja. Antes tenían un segundo generador con
+   * otro tamaño, feed y corte; por eso la Epson cortaba a los pocos
+   * centímetros y el resto aparecía como otra comanda.
+   */
+  const printArea = document.createElement('div');
+  printArea.id = 'comanda-escpos-source';
+  printArea.style.display = 'none';
+
+  const addLine = (value, className = '') => {
+    const element = document.createElement('div');
+    if (className) element.className = className;
+    element.textContent = String(value ?? '');
+    printArea.appendChild(element);
+  };
+  const addSeparator = () => printArea.appendChild(document.createElement('hr'));
+
+  addLine(comanda.barra);
+  addSeparator();
+  if (comanda.orden) addLine(`ORDEN: ${comanda.orden}`);
+  addLine(`CAJA: ${comanda.caja}`);
+  addLine(`PAGO: ${comanda.pago}`);
+  addLine(`FECHA: ${comanda.fecha}`);
+  addSeparator();
+  addLine('CANT  | PRODUCTO');
+
+  comanda.productos.forEach(producto => {
+    const row = document.createElement('div');
+    row.className = 'p-item-row';
+
+    const qty = document.createElement('span');
+    qty.className = 'p-item-qty';
+    qty.textContent = String(producto.cantidad ?? '');
+
+    const name = document.createElement('span');
+    name.className = 'p-item-name';
+    name.textContent = String(producto.nombre ?? '');
+
+    row.append(qty, name);
+    printArea.appendChild(row);
+  });
+
+  if (comanda.nota) {
+    addSeparator();
+    addLine(`NOTA: ${comanda.nota}`);
+  }
+  addSeparator();
+  addLine('PRODUCTO A ENTREGAR', 'p-delivery-label');
+
+  // Un solo initialize, un solo feed y un solo corte: el mismo camino del cierre.
+  return buildEscPosFromComanda(printArea);
+}
+
+async function imprimirComandaUsb(comanda) {
+  const bytes = buildEscPosVentaComanda(comanda);
+  await enviarEscPosPorUsb(bytes);
+}
+
+async function imprimirTicketCuandoEsteListo() {
+  const printArea = document.getElementById('print-area');
+  if (!printArea) {
+    throw new Error('No se encontró la comanda para imprimir');
+  }
+  const bytes = buildEscPosFromComanda(printArea);
+  await enviarEscPosPorUsb(bytes);
+  return true;
+
+  // Código histórico de impresión del navegador. Se conserva debajo de
+  // este return solo como referencia durante la migración a WebUSB.
+
+  /*
+   * Android/Chrome puede ignorar el body > * { display:none } cuando se
+   * imprime el documento principal. En ese caso termina imprimiendo la
+   * pantalla completa del POS. La tablet debe recibir un documento aislado
+   * que contenga únicamente el ticket.
+   */
+  const printFormat = printArea.dataset.printFormat || 'receipt';
+  const oldSafeStyle = document.getElementById('receipt-safe-print-style');
+  if (oldSafeStyle) oldSafeStyle.remove();
+  const safeStyle = document.createElement('style');
+  safeStyle.id = 'receipt-safe-print-style';
+  safeStyle.textContent = printFormat === 'receipt' ? `
+    @media print {
+      @page { size: 80mm auto; margin: 0 !important; }
+      html {
+        width: 80mm !important;
+        height: auto !important;
+        margin: 0 !important;
+        padding: 0 !important;
+      }
+      body {
+        width: 80mm !important;
+        height: auto !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: visible !important;
+        background: #fff !important;
+      }
+      body > * { display: none !important; }
+      #print-area {
+        display: block !important;
+        width: 72mm !important;
+        max-width: 72mm !important;
+        min-width: 72mm !important;
+        margin: 0 auto !important;
+        padding: 0 1mm 3mm !important;
+        box-sizing: border-box !important;
+        color: #000 !important;
+        background: #fff !important;
+        overflow: visible !important;
+        font-family: Arial, Helvetica, sans-serif !important;
+        text-transform: uppercase;
+      }
+      #print-area * { box-sizing: border-box; }
+      #print-area table {
+        width: 100% !important;
+        max-width: 100% !important;
+        table-layout: fixed !important;
+        border-collapse: collapse !important;
+      }
+      #print-area .p-name {
+        min-width: 0 !important;
+        white-space: normal !important;
+        overflow-wrap: anywhere !important;
+        word-break: normal !important;
+        line-height: 1.12 !important;
+      }
+      #print-area .p-qty {
+        width: 17% !important;
+        min-width: 17% !important;
+      }
+      #print-area .pc-row,
+      #print-area .pc-dif,
+      #print-area .pc-total-row {
+        width: 100% !important;
+        min-width: 0 !important;
+        grid-template-columns: minmax(0, 1fr) max-content !important;
+        column-gap: 1.5mm !important;
+      }
+      #print-area .pc-row > span:first-child,
+      #print-area .pc-dif > span:first-child,
+      #print-area .pc-total-row > span:first-child {
+        min-width: 0 !important;
+        overflow-wrap: anywhere !important;
+        word-break: normal !important;
+      }
+      #print-area .pc-row > span:last-child,
+      #print-area .pc-dif > span:last-child,
+      #print-area .pc-total-row > span:last-child {
+        white-space: nowrap !important;
+        text-align: right !important;
+      }
+      #print-area .p-title,
+      #print-area .p-date,
+      #print-area .p-pago,
+      #print-area .pc-brand,
+      #print-area .pc-titulo,
+      #print-area .pc-info,
+      #print-area .pc-metodo,
+      #print-area .pc-estado {
+        max-width: 100% !important;
+        overflow-wrap: anywhere !important;
+        word-break: normal !important;
+      }
+      #print-area .p-divider,
+      #print-area .pc-divider {
+        width: 100% !important;
+        max-width: 100% !important;
+      }
+      #print-area .pc-total-bloque {
+        width: 100% !important;
+        max-width: 100% !important;
+      }
+      #print-area tr,
+      #print-area .pc-metodo,
+      #print-area .pc-total-bloque {
+        break-inside: avoid !important;
+        page-break-inside: avoid !important;
+      }
+      #print-area .p-header-row {
+        display: flex !important;
+        align-items: baseline !important;
+        justify-content: space-between !important;
+        gap: 2mm !important;
+        width: 100% !important;
+        margin: 0 0 2pt !important;
+      }
+      #print-area .p-header-row .p-title {
+        flex: 1 1 auto !important;
+        min-width: 0 !important;
+        margin: 0 !important;
+        text-align: left !important;
+        font-size: 12pt !important;
+        font-weight: 900 !important;
+        line-height: 1.05 !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: clip !important;
+      }
+      #print-area .p-header-row .p-pago {
+        flex: 0 0 auto !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        font-size: 7pt !important;
+        font-weight: 900 !important;
+        line-height: 1.05 !important;
+        white-space: nowrap !important;
+        text-align: right !important;
+      }
+      #print-area .p-order {
+        display: block !important;
+        width: 100% !important;
+        margin: 0 0 2pt !important;
+        font-size: 8pt !important;
+        font-weight: 900 !important;
+        line-height: 1.1 !important;
+        white-space: nowrap !important;
+        text-align: left !important;
+      }
+      #print-area .p-meta-row {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 2mm !important;
+        width: 100% !important;
+        margin: 0 0 1pt !important;
+      }
+      #print-area .p-ticket-meta {
+        display: flex !important;
+        align-items: baseline !important;
+        justify-content: space-between !important;
+        gap: 2mm !important;
+        width: 100% !important;
+        margin: 0 0 2pt !important;
+      }
+      #print-area .p-caja {
+        flex: 1 1 auto !important;
+        min-width: 0 !important;
+        font-size: 8pt !important;
+        font-weight: 900 !important;
+        line-height: 1.1 !important;
+      }
+      #print-area .p-datetime {
+        flex: 0 0 auto !important;
+        font-size: 8pt !important;
+        font-weight: 700 !important;
+        line-height: 1.1 !important;
+        white-space: nowrap !important;
+        text-align: right !important;
+      }
+      #print-area .p-cajera {
+        flex: 1 1 auto !important;
+        min-width: 0 !important;
+        font-size: 8pt !important;
+        font-weight: 900 !important;
+        line-height: 1.1 !important;
+        overflow-wrap: anywhere !important;
+      }
+      #print-area .p-hora {
+        flex: 0 0 auto !important;
+        font-size: 10pt !important;
+        font-weight: 900 !important;
+        line-height: 1.1 !important;
+        white-space: nowrap !important;
+        text-align: right !important;
+      }
+      #print-area .p-fecha {
+        display: none !important;
+      }
+      #print-area .pc-section-divider {
+        border: none !important;
+        border-top: 1.5px solid #000 !important;
+        width: 100% !important;
+        margin: 5pt 0 3pt !important;
+      }
+    }
+  ` : '';
+  if (safeStyle.textContent) document.head.appendChild(safeStyle);
+
+  let cleaned = false;
+  let fallbackTimer = null;
+  let printFrame = null;
+  let printStarted = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    window.removeEventListener('afterprint', cleanup);
+    if (printFrame?.contentWindow) {
+      printFrame.contentWindow.removeEventListener('afterprint', cleanup);
+    }
+    if (printFrame) printFrame.remove();
+    const el = document.getElementById('print-area');
+    if (el) el.remove();
+    const style = document.getElementById('print-style-tag');
+    if (style) style.remove();
+    const safe = document.getElementById('receipt-safe-print-style');
+    if (safe) safe.remove();
+  };
+
+  window.addEventListener('afterprint', cleanup);
+
+  const printNow = () => {
+    if (cleaned || printStarted || !printFrame?.contentWindow) return;
+    printStarted = true;
+    try {
+      printFrame.contentWindow.focus();
+      printFrame.contentWindow.addEventListener('afterprint', cleanup, { once: true });
+       // Transporte de impresión reemplazado por WebUSB + ESC/POS.
+    } catch (error) {
+      console.warn('No se pudo abrir la impresión:', error);
+      cleanup();
+      showToast('No se pudo abrir la ventana de impresión', 3500);
+    }
+  };
+
+  const clonedTicket = printArea.cloneNode(true);
+  clonedTicket.style.display = 'block';
+  clonedTicket.style.position = 'static';
+  clonedTicket.style.left = '';
+  clonedTicket.style.top = '';
+  clonedTicket.removeAttribute('aria-hidden');
+
+  const dynamicStyle = document.getElementById('print-style-tag')?.textContent || '';
+  const isolatedStyle = safeStyle.textContent || '';
+  printFrame = document.createElement('iframe');
+  printFrame.setAttribute('title', 'Comanda para imprimir');
+  printFrame.setAttribute('aria-hidden', 'true');
+  const frameWidth = printFormat === 'a4' ? '210mm' : '80mm';
+  printFrame.style.cssText =
+    `position:fixed;left:-10000px;top:0;width:${frameWidth};height:1000px;border:0;opacity:0;`;
+  document.body.appendChild(printFrame);
+
+  const frameDocument = printFrame.contentDocument;
+  if (!frameDocument) {
+    cleanup();
+    showToast('No se pudo preparar la comanda para imprimir', 3500);
+    return;
+  }
+  frameDocument.open();
+  frameDocument.write(`<!doctype html>
+    <html lang="es">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>${dynamicStyle}</style>
+        <style>${isolatedStyle}</style>
+      </head>
+      <body>${clonedTicket.outerHTML}</body>
+    </html>`);
+  frameDocument.close();
+
+  const printWhenLoaded = () => {
+    requestAnimationFrame(() => requestAnimationFrame(printNow));
+  };
+  printFrame.addEventListener('load', printWhenLoaded, { once: true });
+  // Algunos servicios de impresión Android no reportan load para srcdoc/
+  // documentos escritos; este respaldo solo intenta imprimir, no imprime
+  // la página principal.
+  setTimeout(printWhenLoaded, 120);
+  fallbackTimer = setTimeout(cleanup, 30000);
+}
+
+  document.getElementById('co-confirm').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+
+    if (btn.disabled) return;
+  if (pendingSavedVenta) {
+    showToast('La venta ya está guardada. Reintenta solamente la impresión.', 3500, 'warning');
+    return;
+  }
+
+    // Evita doble clic mientras se procesa la venta
+    btn.disabled = true;
+    btn.textContent = 'PROCESANDO…';
+
+    const {
+      subtotal,
+      descuentoMonto,
+      total
+    } = getSaleTotals();
+
+    if (!selectedPaymentMethod) {
+      showToast('⚠️ Selecciona un método de pago', 3000);
+      btn.disabled = false;
+      btn.textContent = '✓ Confirmar';
+      return;
+    }
+
+    let monto_qr = 0;
+    let monto_ef = 0;
+    let monto_tar = 0;
+
+    let pagoDetalle = selectedPaymentMethod.toUpperCase();
+
+    // ── PAGO MIXTO ──────────────────────────────────────────
+    if (selectedPaymentMethod === 'mixto') {
+
+      monto_qr =
+        parseFloat(document.getElementById('mixto-qr').value) || 0;
+
+      monto_ef =
+        parseFloat(document.getElementById('mixto-efectivo').value) || 0;
+
+      monto_tar =
+        parseFloat(document.getElementById('mixto-tarjeta').value) || 0;
+
+      const partes = [];
+
+      if (monto_ef > 0)
+        partes.push(`Efec. ${fmt(monto_ef)}`);
+
+      if (monto_qr > 0)
+        partes.push(`QR ${fmt(monto_qr)}`);
+
+      if (monto_tar > 0)
+        partes.push(`Tarj. ${fmt(monto_tar)}`);
+
+      pagoDetalle = partes.join(' - ');
+
+    } else if (selectedPaymentMethod === 'qr') {
+
+      monto_qr = total;
+
+    } else if (selectedPaymentMethod === 'efectivo') {
+
+      monto_ef = total;
+
+    } else if (selectedPaymentMethod === 'tarjeta') {
+
+      monto_tar = total;
+    }
+
+    const session = getCurrentSession();
+    /*
+     * Mantener la misma marca de tiempo si el primer intento queda
+     * incierto por red. Esto permite reconciliarlo sin crear otra venta.
+     */
+    const now = new Date(pendingVentaTimestamp || new Date().toISOString());
+    pendingVentaTimestamp = now.toISOString();
+
+    // ── DATOS DE LA VENTA ───────────────────────────────────
+    const ventaObj = {
+      cajero: session ? session.usuario : 'invitado',
+      cajero_nombre: session ? session.nombre : 'Invitado',
+      caja: session ? session.caja : 'Sin caja',
+      turno_id: getTurno()?.id || null,
+
+      productos: cart.map(i => ({
+        nombre: i.name,
+        qty: i.qty,
+        precio: i.price
+      })),
+
+      nota: document.getElementById('order-note')?.value.trim() || null,
+
+      subtotal: parseFloat(subtotal.toFixed(2)),
+      descuento_tipo: discountValue > 0 ? discountType : null,
+      descuento_valor: parseFloat(discountValue.toFixed(2)),
+      descuento_monto: parseFloat(descuentoMonto.toFixed(2)),
+
+      total: parseFloat(total.toFixed(2)),
+      metodo_pago: selectedPaymentMethod,
+      monto_qr: parseFloat(monto_qr.toFixed(2)),
+      monto_efectivo: parseFloat(monto_ef.toFixed(2)),
+      monto_tarjeta: parseFloat(monto_tar.toFixed(2)),
+
+      creado_en: now.toISOString(),
+      registrado: false,
+      anulado: false
+    };
+
+    let savedId = null;
+    let ordenNumero = null;
+
+    // ── GUARDAR EN SUPABASE ─────────────────────────────────
+    // Una venta no se considera exitosa si Supabase no confirmó el insert.
+    // El carrito queda intacto para poder reintentar sin perder la comanda.
+    try {
+      if (!supabaseClient) {
+        throw new Error('No hay conexión con Supabase');
+      }
+
+      const insertResult = await supabaseClient
+        .from('ventas')
+        .insert([{
+          ...ventaObj,
+          registrado: true
+        }])
+        .select('id')
+        .single();
+
+      let savedRow = insertResult.data;
+      if (insertResult.error) {
+        /*
+         * Si el servidor guardó la venta pero la respuesta se perdió,
+         * buscamos exactamente la misma venta antes de permitir reintentar.
+         * No usamos COUNT(*) ni localStorage para decidir si se guardó.
+         */
+        const { data: existingRow, error: reconcileError } = await supabaseClient
+          .from('ventas')
+          .select('id')
+          .eq('cajero', ventaObj.cajero)
+          .eq('caja', ventaObj.caja)
+          .eq('creado_en', ventaObj.creado_en)
+          .maybeSingle();
+
+        if (reconcileError || !existingRow) throw insertResult.error;
+        savedRow = existingRow;
+      }
+
+      if (!savedRow?.id) {
+        throw new Error('Supabase no devolvió el ID de la venta');
+      }
+
+      savedId = savedRow.id;
+      ventaObj.registrado = true;
+      ordenNumero = getOrderReference(savedId);
+      lastOrderReference = ordenNumero;
+      updateOrderNumberDisplay(ordenNumero);
+    } catch (error) {
+      console.error('Error guardando venta:', error);
+      pendingComandaData = null;
+      btn.disabled = false;
+      btn.textContent = '✓ Confirmar';
+      showToast(
+        `⚠️ No se guardó la venta: ${error.message || 'error de conexión'}`,
+        5000,
+        'warning'
+      );
+      return;
+    }
+
+    ventaObj.id = savedId;
+
+    showToast(
+      ventaObj.registrado
+        ? '✅ Venta registrada'
+        : '⚠️ Venta no registrada en Supabase',
+      3000
+    );
+
+    // ── CREAR DATOS DE COMANDA ───────────────────────────────
+    pendingComandaData = crearDatosComanda(
+      pagoDetalle,
+      ordenNumero,
+      cart,
+      session,
+      now,
+      ventaObj.nota
+    );
+    pendingSavedVenta = {
+      id: savedId,
+      referencia: ordenNumero,
+      creado_en: ventaObj.creado_en
+    };
+
+    // ── IMPRESIÓN AUTOMÁTICA ────────────────────────────────
+    try {
+
+      await imprimirComandaUsb(
+        pendingComandaData
+      );
+
+      // ── IMPRESIÓN CORRECTA ────────────────────────────────
+      showToast(
+        '✅ Comanda impresa automáticamente',
+        2500
+      );
+
+      // Eliminar posibles elementos antiguos de impresión
+      const legacyPrintArea =
+        document.getElementById('print-area');
+
+      if (legacyPrintArea) {
+        legacyPrintArea.remove();
+      }
+
+      const legacyPrintStyle =
+        document.getElementById('print-style-tag');
+
+      if (legacyPrintStyle) {
+        legacyPrintStyle.remove();
+      }
+
+      // Vaciar carrito
+      clearCart();
+      // Limpiar nota del pedido
+      const orderNote = document.getElementById('order-note');
+
+      if (orderNote) {
+        orderNote.value = '';
+      }
+      // Limpiar descuento del pedido
+      discountType = 'bs';
+      discountValue = 0;
+
+      const discountInput =
+        document.getElementById('order-discount-value');
+
+      if (discountInput) {
+        discountInput.value = '';
+      }
+
+      document.querySelectorAll('.discount-type')
+        .forEach(btn => {
+          btn.classList.toggle(
+            'active',
+            btn.dataset.discountType === 'bs'
+          );
+        });
+
+      const discountResult =
+        document.getElementById('order-discount-result');
+
+      if (discountResult) {
+        discountResult.textContent = '';
+      }
+      // Ocultar panel de impresión
+      const printPanel =
+        document.getElementById('post-sale-print');
+
+      const printMessage =
+        document.getElementById('post-sale-print-msg');
+
+      printPanel.classList.remove('show');
+      printMessage.textContent = '';
+
+      // ── CERRAR MODAL DE MÉTODO DE PAGO ─────────────────────
+      document
+        .getElementById('checkout-modal')
+        .classList.remove('open');
+
+      // ── PREPARAR SISTEMA PARA LA SIGUIENTE VENTA ──────────
+      selectedPaymentMethod = null;
+      pendingComandaData = null;
+      pendingVentaTimestamp = null;
+      pendingSavedVenta = null;
+
+      // Restaurar botón Confirmar
+      btn.textContent = '✓ Confirmar';
+      btn.disabled = true;
+
+      // Habilitar métodos de pago nuevamente
+      document
+        .querySelectorAll('.pay-btn')
+        .forEach(paymentBtn => {
+
+          paymentBtn.disabled = false;
+          paymentBtn.classList.remove('selected');
+
+        });
+
+      // Limpiar efectivo
+      const cashReceived =
+        document.getElementById('cash-received');
+
+      if (cashReceived) {
+        cashReceived.value = '';
+      }
+
+      const cashFeedback =
+        document.getElementById('cash-feedback');
+
+      if (cashFeedback) {
+        cashFeedback.textContent = '';
+        cashFeedback.className = 'cash-feedback';
+      }
+
+      // Limpiar pago mixto
+      document
+        .querySelectorAll('.mixto-input')
+        .forEach(input => {
+          input.value = '';
+        });
+
+      const mixtoStatus =
+        document.getElementById('mixto-status');
+
+      if (mixtoStatus) {
+        mixtoStatus.textContent = '';
+        mixtoStatus.className = 'mixto-status';
+      }
+
+      // Ocultar áreas de pago
+      const cashArea =
+        document.getElementById('cash-input-area');
+
+      if (cashArea) {
+        cashArea.style.display = 'none';
+      }
+
+      const mixtoArea =
+        document.getElementById('mixto-input-area');
+
+      if (mixtoArea) {
+        mixtoArea.style.display = 'none';
+      }
+
+      // Actualizar carrito/pantalla
+      renderCart();
+
+    } catch (error) {
+
+      // ── IMPRESIÓN FALLIDA ─────────────────────────────────
+      console.error(
+        'Error de impresión automática:',
+        error
+      );
+
+      showToast(
+        '⚠️ La venta se guardó, pero la impresión falló',
+        4500
+      );
+
+      // NO cerramos el modal.
+      // NO borramos la comanda.
+      // NO dejamos bloqueado el sistema.
+
+      document
+        .getElementById('post-sale-print-msg')
+        .textContent =
+          'Venta guardada, pero la impresión falló. Puedes reintentar.';
+
+      document
+        .getElementById('post-sale-print')
+        .classList.add('show');
+
+      // La venta ya está guardada: solo se debe reintentar la impresión.
+      // Mantener Confirmar deshabilitado evita una venta duplicada.
+      btn.disabled = true;
+      btn.textContent = 'VENTA GUARDADA';
+    }
+  });
+
+
+
+document.getElementById('print-comanda-btn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'ENVIANDO A EPSON…';
+  try {
+    await imprimirComandaUsb(pendingComandaData);
+    btn.textContent = 'COMANDA IMPRESA';
+    document.getElementById('post-sale-print-msg').textContent =
+      'Comanda enviada correctamente a la Epson';
+    showToast('✅ Comanda impresa', 2500);
+    document.getElementById('checkout-modal').classList.remove('open');
+    document.getElementById('post-sale-print').classList.remove('show');
+    document.getElementById('co-confirm').textContent = '✓ Confirmar';
+    document.getElementById('co-confirm').disabled = true;
+    document.querySelectorAll('.pay-btn').forEach(paymentBtn => {
+      paymentBtn.disabled = false;
+    });
+    clearCart();
+    selectedPaymentMethod = null;
+    pendingComandaData = null;
+    pendingVentaTimestamp = null;
+    pendingSavedVenta = null;
+  } catch (error) {
+    console.error('Error de impresión WebUSB:', error);
+    btn.disabled = false;
+    btn.textContent = 'IMPRIMIR COMANDA';
+    document.getElementById('post-sale-print-msg').textContent =
+      'Pedido guardado correctamente, pero la impresión falló';
+    showToast(`⚠️ ${error.message || 'La impresión falló'}`, 4500);
+  }
+});
+
+document.getElementById('checkout-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('checkout-modal'))
+    document.getElementById('checkout-modal').classList.remove('open');
+});
+
+const searchEl = document.getElementById('search');
+const clearBtn = document.getElementById('search-clear');
+const doneBtn = document.getElementById('search-done');
+// Click on the icon button focuses the input to expand the search bar
+document.getElementById('search-icon-btn').addEventListener('click', () => searchEl.focus());
+// Prevent Chrome from showing saved credentials in the search field
+searchEl.addEventListener('focus', () => {
+  searchEl.setAttribute('name', 'q-' + Math.random().toString(36).slice(2));
+  searchEl.setAttribute('autocomplete', 'off');
+});
+searchEl.addEventListener('mousedown', () => {
+  searchEl.setAttribute('name', 'q-' + Math.random().toString(36).slice(2));
+});
+searchEl.addEventListener('input', e => {
+  searchQ = e.target.value;
+  clearBtn.style.display = searchQ ? 'flex' : 'none';
+  renderProducts();
+});
+clearBtn.addEventListener('click', () => {
+  searchEl.value = ''; searchQ = '';
+  clearBtn.style.display = 'none';
+  renderProducts();
+});
+doneBtn.addEventListener('click', () => {
+  // Terminar la selección: algunos navegadores de tabletas necesitan readonly
+  // temporal para cerrar completamente el teclado virtual.
+  searchEl.setAttribute('readonly', 'readonly');
+  searchEl.blur();
+  doneBtn.blur();
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
+  setTimeout(() => {
+    searchEl.removeAttribute('readonly');
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  }, 180);
+});
+
+let toastTimer;
+const toastEl = document.getElementById('toast');
+function showToast(msg, dur=3000, variant='success') {
+  toastEl.textContent = msg;
+  toastEl.classList.toggle('warning', variant === 'warning');
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toastEl.classList.remove('show', 'warning');
+  }, dur);
+}
+
+/* ========== CONFIRM TOAST ========== */
+let _confirmResolve = null;
+const confirmToastEl = document.getElementById('confirm-toast');
+const ctConfirmBtn   = document.getElementById('ct-confirm');
+const ctCancelBtn    = document.getElementById('ct-cancel');
+
+ctConfirmBtn.addEventListener('click', () => {
+  confirmToastEl.classList.remove('show');
+  if (_confirmResolve) { _confirmResolve(true); _confirmResolve = null; }
+});
+ctCancelBtn.addEventListener('click', () => {
+  confirmToastEl.classList.remove('show');
+  if (_confirmResolve) { _confirmResolve(false); _confirmResolve = null; }
+});
+
+function showConfirm({ msg, icon = '⚠️', confirmText = 'Confirmar', confirmCls = 'danger' }) {
+  return new Promise(resolve => {
+    if (_confirmResolve) { _confirmResolve(false); }
+    _confirmResolve = resolve;
+    document.getElementById('ct-icon').textContent    = icon;
+    document.getElementById('ct-msg').textContent     = msg;
+    ctConfirmBtn.textContent  = confirmText;
+    ctConfirmBtn.className    = `ct-btn ${confirmCls}`;
+    confirmToastEl.classList.add('show');
+  });
+}
+
+renderDock();
+renderProducts();
+renderCart();
+updateDockCajaLabel();
+
+/* ========== SESSION (Supabase-backed) ========== */
+// localStorage solo guarda el token (UUID). Los datos reales viven en pos_sessions en Supabase.
+// Sesión expira tras 1 hora sin actividad.
+
+const SESSION_TOKEN_KEY = 'pos_session_token';
+const SESSION_TTL_MS    = 60 * 60 * 1000; // 1 hora
+
+function _getToken() {
+  let t = localStorage.getItem(SESSION_TOKEN_KEY);
+  if (!t) { t = crypto.randomUUID(); localStorage.setItem(SESSION_TOKEN_KEY, t); }
+  return t;
+}
+
+function getCurrentSession() { return _sessionCache; }
+
+function sessionCaja(s = getCurrentSession()) {
+  return String(s?.caja || '').toLowerCase().trim();
+}
+
+function esCaja1(s = getCurrentSession()) {
+  return sessionCaja(s) === 'caja 1';
+}
+
+function actualizarPermisosDeCaja(s = getCurrentSession()) {
+  const filtroTodas = document.getElementById('ord-filter-todas');
+  const reportePorCaja = document.querySelector('.rep-option-btn[data-tipo="cajas"]');
+  const puedeVerGeneral = esCaja1(s);
+
+  if (filtroTodas) {
+    filtroTodas.style.display = puedeVerGeneral ? '' : 'none';
+    if (!puedeVerGeneral) filtroTodas.classList.remove('active');
+  }
+  if (reportePorCaja) {
+    reportePorCaja.style.display = puedeVerGeneral ? '' : 'none';
+    if (!puedeVerGeneral && repTipo === 'cajas') {
+      repTipo = null;
+      reportePorCaja.classList.remove('active');
+    }
+  }
+}
+
+async function setSession(data) {
+  _sessionCache = data;
+  if (!supabaseClient) return;
+  try {
+    await supabaseClient.from('pos_sessions').upsert({
+      token: _getToken(),
+      usuario: data.usuario,
+      nombre:  data.nombre,
+      caja:    data.caja,
+      admin:   !!data.admin,
+      activo_en: new Date().toISOString()
+    });
+  } catch(e) { console.warn('Error guardando sesión en Supabase:', e); }
+}
+
+async function clearSession() {
+  _sessionCache = null;
+  const token = localStorage.getItem(SESSION_TOKEN_KEY);
+  localStorage.removeItem(SESSION_TOKEN_KEY);
+  if (!supabaseClient || !token) return;
+  try { await supabaseClient.from('pos_sessions').delete().eq('token', token); } catch(_) {}
+}
+
+// Actualiza activo_en cada 10 min para mantener sesión viva
+setInterval(async () => {
+  const token = localStorage.getItem(SESSION_TOKEN_KEY);
+  if (!supabaseClient || !token || !_sessionCache) return;
+  try { await supabaseClient.from('pos_sessions').update({ activo_en: new Date().toISOString() }).eq('token', token); } catch(_) {}
+}, 10 * 60 * 1000);
+
+function applySession(s) {
+  document.getElementById('badge-nombre').textContent = s.nombre;
+  document.getElementById('badge-caja').textContent   = s.caja;
+  document.getElementById('login-overlay').classList.add('hidden');
+  document.getElementById('top-user').style.display = 'flex';
+  actualizarPermisosDeCaja(s);
+}
+
+function calcEsAdmin(s) {
+  if (!s) return false;
+  return !!(s.admin)
+    || s.usuario?.toLowerCase().includes('daniel')
+    || s.nombre?.toLowerCase().includes('daniel');
+}
+
+async function initSession() {
+  // Verifica sesión en Supabase y espera mínimo 6s en paralelo
+  let sessionFound = false;
+
+  const supabaseCheck = async () => {
+    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    if (!token || !supabaseClient) return;
+    try {
+      const { data } = await supabaseClient
+        .from('pos_sessions').select('*').eq('token', token).maybeSingle();
+      if (data) {
+        const elapsed = Date.now() - new Date(data.activo_en).getTime();
+        if (elapsed < SESSION_TTL_MS) {
+          _sessionCache = { usuario: data.usuario, nombre: data.nombre, caja: data.caja, admin: !!data.admin };
+          applySession(_sessionCache);
+          await supabaseClient.from('pos_sessions').update({ activo_en: new Date().toISOString() }).eq('token', token);
+          try {
+            const { data: turno } = await supabaseClient
+              .from('turnos_caja').select('*')
+              .eq('cajero', data.usuario).eq('estado', 'abierta')
+              .order('abierta_en', { ascending: false }).limit(1).maybeSingle();
+            if (turno) setTurno(turno);
+          } catch(_) {}
+          updateDockCajaLabel();
+          startTurnoSync();
+          sessionFound = true;
+        } else {
+          await clearSession();
+        }
+      }
+    } catch(e) { console.warn('Error restaurando sesión:', e); }
+  };
+
+  // La consulta remota no debe bloquear el arranque si la red queda esperando.
+  // Tras 3s se continúa con el login local y el POS sigue siendo utilizable.
+  const boundedSessionCheck = Promise.race([
+    supabaseCheck(),
+    new Promise(resolve => setTimeout(resolve, 3000))
+  ]);
+
+  // Corre verificación y timer de 6s en paralelo
+  await Promise.all([boundedSessionCheck, new Promise(r => setTimeout(r, 6000))]);
+
+  // Mostrar checkmark animado
+  const icon   = document.getElementById('il-icon');
+  const check  = document.getElementById('il-check');
+  const circle = check.querySelector('circle:nth-child(2)');
+  const mark   = document.getElementById('il-check-mark');
+  const sub    = document.getElementById('il-sub');
+
+  icon.style.opacity  = '0';
+  icon.style.animation = 'none';
+  setTimeout(() => {
+    check.style.opacity = '1';
+    sub.textContent = '¡Listo!';
+    sub.style.color = '#4ade80';
+    circle.style.strokeDashoffset = '0';
+    mark.style.strokeDashoffset   = '0';
+  }, 350);
+
+  // Espera que se vea el check (~1.5s) y luego procede
+  await new Promise(r => setTimeout(r, 1800));
+
+  document.getElementById('init-loading').classList.add('hidden');
+  if (!sessionFound) {
+    document.getElementById('login-overlay').classList.remove('hidden');
+  }
+}
+
+/* ========== LOGIN ========== */
+document.getElementById('login-btn').addEventListener('click', doLogin);
+document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+document.getElementById('login-usuario').addEventListener('keydown', e => { if(e.key==='Enter') document.getElementById('login-pass').focus(); });
+
+async function doLogin() {
+  const btn   = document.getElementById('login-btn');
+  const user  = document.getElementById('login-usuario').value.trim().toLowerCase();
+  const pass  = document.getElementById('login-pass').value;
+  const errEl = document.getElementById('login-error');
+  if (!user || !pass) { errEl.textContent = 'Completa usuario y contraseña'; return; }
+  btn.disabled = true; btn.textContent = 'Verificando…';
+  errEl.textContent = '';
+  try {
+    if (!supabaseClient) {
+      throw new Error('SUPABASE_NOT_CONNECTED');
+    }
+    const { data, error } = await supabaseClient
+      .from('cajeras')
+      .select('*')
+      .eq('usuario', user)
+      .eq('contrasena', pass)
+      .eq('activo', true)
+      .maybeSingle();
+    if (error) {
+      console.error('Error de Supabase al iniciar sesión:', error);
+      if (error.code === '42501' || error.code === 'PGRST301') {
+        errEl.textContent = 'Supabase bloqueó el acceso a la tabla cajeras. Revisa las políticas RLS.';
+      } else if (error.code === '42703' || error.code === 'PGRST204') {
+        errEl.textContent = 'La tabla cajeras no tiene una columna requerida por la aplicación.';
+      } else {
+        errEl.textContent = 'Error de Supabase: ' + (error.message || 'no se pudo consultar cajeras');
+      }
+      btn.disabled = false; btn.textContent = 'Ingresar →'; return;
+    }
+    if (!data) {
+      errEl.textContent = 'No existe un usuario activo con esos datos. Usa usuario caja1 y contraseña 123.';
+      btn.disabled = false; btn.textContent = 'Ingresar →'; return;
+    }
+    const tempS = { usuario: data.usuario, nombre: data.nombre, caja: data.caja };
+    const session = { ...tempS, admin: calcEsAdmin(tempS) || !!(data.admin) || data.rol === 'admin' };
+    await setSession(session);
+    applySession(session);
+    startTurnoSync();
+  } catch(e) {
+    console.error('Error iniciando sesión:', e);
+    errEl.textContent = e.message === 'SUPABASE_NOT_CONNECTED'
+      ? 'Supabase no está conectado. Recarga la página e inténtalo de nuevo.'
+      : 'Error de conexión con Supabase. Revisa tu conexión a internet.';
+    btn.disabled = false; btn.textContent = 'Ingresar →';
+  }
+}
+
+/* ========== LOGOUT ========== */
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  const ok = await showConfirm({ msg: '¿Cerrar sesión?', icon: '🔒', confirmText: 'Sí, salir', confirmCls: 'warn' });
+  if (!ok) return;
+  stopTurnoSync();
+  await clearSession();
+  document.getElementById('badge-nombre').textContent = '—';
+  document.getElementById('badge-caja').textContent   = 'Sin sesión';
+  document.getElementById('login-usuario').value = '';
+  document.getElementById('login-pass').value    = '';
+  document.getElementById('login-error').textContent = '';
+  document.getElementById('login-btn').disabled = false;
+  document.getElementById('login-btn').textContent = 'Ingresar →';
+  document.getElementById('login-overlay').classList.remove('hidden');
+  document.getElementById('top-user').style.display = 'none';
+  actualizarPermisosDeCaja(null);
+  clearCart();
+});
+
+/* ========== INVENTARIOS ========== */
+let invFilter = 'hoy';
+document.getElementById('inv-close').addEventListener('click', () => document.getElementById('inventarios-modal').classList.remove('open'));
+document.getElementById('inv-filter-hoy').addEventListener('click', () => { invFilter='hoy'; setFilterActive('inv',invFilter); loadInventarios(invFilter); });
+document.getElementById('inv-filter-todo').addEventListener('click', () => { invFilter='todo'; setFilterActive('inv',invFilter); loadInventarios(invFilter); });
+
+function setFilterActive(prefix, val) {
+  document.querySelectorAll(`#${prefix}-filter-hoy, #${prefix}-filter-todo`).forEach(b => b.classList.toggle('active', b.dataset.filter===val));
+}
+// =========================================================
+// NOTA DEL PEDIDO — MODAL
+// =========================================================
+
+const orderNoteBtn =
+  document.getElementById('order-note-btn');
+
+const orderNoteModal =
+  document.getElementById('order-note-modal');
+
+const orderNoteClose =
+  document.getElementById('order-note-close');
+
+const orderNoteSave =
+  document.getElementById('order-note-save');
+
+const orderNoteModalInput =
+  document.getElementById('order-note-modal-input');
+
+const orderNoteOriginal =
+  document.getElementById('order-note');
+
+
+orderNoteBtn?.addEventListener('click', () => {
+
+  if (orderNoteModalInput && orderNoteOriginal) {
+    orderNoteModalInput.value =
+      orderNoteOriginal.value || '';
+  }
+
+  orderNoteModal?.classList.add('open');
+
+  setTimeout(() => {
+    orderNoteModalInput?.focus();
+  }, 80);
+
+});
+
+
+orderNoteClose?.addEventListener('click', () => {
+  orderNoteModal?.classList.remove('open');
+});
+
+
+orderNoteSave?.addEventListener('click', () => {
+
+  if (orderNoteModalInput && orderNoteOriginal) {
+    orderNoteOriginal.value =
+      orderNoteModalInput.value.trim();
+  }
+
+  orderNoteModal?.classList.remove('open');
+});
+
+
+orderNoteModal?.addEventListener('click', (e) => {
+
+  if (e.target === orderNoteModal) {
+    orderNoteModal.classList.remove('open');
+  }
+
+});
+async function loadInventarios(filtro) {
+  const grid    = document.getElementById('inv-cajas-grid');
+  const summary = document.getElementById('inv-summary');
+  grid.innerHTML    = '<div class="inv-empty" style="color:var(--text-dim);padding:30px;text-align:center;">Cargando…</div>';
+  summary.innerHTML = '';
+  try {
+    const _invSess = getCurrentSession();
+    const _invCaja = (_invSess?.caja || '').toLowerCase().trim();
+    const _invCanSeeAll = esCaja1(_invSess);
+    let q = supabaseClient.from('ventas').select('*').eq('anulado', false);
+    if (filtro === 'hoy') {
+      const hoy = new Date().toISOString().slice(0,10);
+      q = q.gte('creado_en', hoy + 'T00:00:00').lte('creado_en', hoy + 'T23:59:59');
+    }
+    if (!_invCanSeeAll && _invSess) q = q.eq('caja', _invSess.caja);
+    const { data, error } = await q;
+    if (error) throw error;
+    const rows = data || [];
+
+    let totalQr=0, totalEf=0, totalTar=0, totalGen=0, totalCnt=0;
+    rows.forEach(r => {
+      totalQr  += +r.monto_qr       || 0;
+      totalEf  += +r.monto_efectivo || 0;
+      totalTar += +r.monto_tarjeta  || 0;
+      totalGen += +r.total          || 0;
+      totalCnt++;
+    });
+
+    summary.innerHTML = `
+      <div class="sum-card">
+         <div class="sum-card-icon">QR</div>
+        <div class="sum-card-label">QR</div>
+        <div class="sum-card-value">Bs ${totalQr.toFixed(2)}</div>
+      </div>
+      <div class="sum-card">
+         <div class="sum-card-icon">EF</div>
+        <div class="sum-card-label">Efectivo</div>
+        <div class="sum-card-value">Bs ${totalEf.toFixed(2)}</div>
+      </div>
+      <div class="sum-card">
+         <div class="sum-card-icon">TC</div>
+        <div class="sum-card-label">Tarjeta</div>
+        <div class="sum-card-value">Bs ${totalTar.toFixed(2)}</div>
+      </div>
+      <div class="sum-card">
+         <div class="sum-card-icon">TOTAL</div>
+        <div class="sum-card-label">Total General</div>
+        <div class="sum-card-value">Bs ${totalGen.toFixed(2)}</div>
+      </div>`;
+
+    const porCaja = {};
+    rows.forEach(r => {
+      const k = r.caja || 'Sin caja';
+      if (!porCaja[k]) porCaja[k] = { cajero: r.cajero_nombre||r.cajero||'—', qr:0, ef:0, tar:0, total:0, cnt:0 };
+      porCaja[k].qr    += +r.monto_qr       || 0;
+      porCaja[k].ef    += +r.monto_efectivo  || 0;
+      porCaja[k].tar   += +r.monto_tarjeta   || 0;
+      porCaja[k].total += +r.total           || 0;
+      porCaja[k].cnt++;
+    });
+
+    const cajas = Object.keys(porCaja).sort();
+    if (!cajas.length) {
+      grid.innerHTML = '<div class="inv-empty">Sin ventas registradas</div>';
+      return;
+    }
+
+    grid.innerHTML = cajas.map(caja => {
+      const d = porCaja[caja];
+      const num = caja.replace(/[^0-9]/g,'') || caja;
+      return `
+      <div class="inv-caja-card">
+        <div class="inv-caja-header">
+          <div>
+            <div class="inv-caja-name"><span class="inv-caja-badge">C${num}</span><span>Caja ${num}</span></div>
+            <div class="inv-caja-cajero">${d.cajero}</div>
+          </div>
+          <div class="inv-caja-cnt">${d.cnt} venta${d.cnt!==1?'s':''}</div>
+        </div>
+        <div class="inv-caja-methods">
+          <div class="inv-method-item">
+            <div class="inv-method-label">QR</div>
+            <div class="inv-method-val">Bs ${d.qr.toFixed(2)}</div>
+          </div>
+          <div class="inv-method-item">
+            <div class="inv-method-label">Efectivo</div>
+            <div class="inv-method-val">Bs ${d.ef.toFixed(2)}</div>
+          </div>
+          <div class="inv-method-item">
+            <div class="inv-method-label">Tarjeta</div>
+            <div class="inv-method-val">Bs ${d.tar.toFixed(2)}</div>
+          </div>
+        </div>
+        <div class="inv-caja-total">
+          <span class="inv-caja-total-lbl">Total Caja</span>
+          <span class="inv-caja-total-val">Bs ${d.total.toFixed(2)}</span>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    grid.innerHTML = `<div class="inv-empty" style="color:#ff6b6b;">Error: ${e.message}</div>`;
+  }
+}
+
+/* ========== REPORTES ========== */
+let repVentas = [];
+
+async function loadReportes() {
+  try {
+    const s = getCurrentSession();
+    let q = supabaseClient
+      .from('ventas').select('*')
+      .eq('anulado', false)
+      .order('creado_en', { ascending: false })
+      .limit(5000);
+    if (!esCaja1(s)) q = q.eq('caja', s?.caja || '');
+    const { data, error } = await q;
+    if (error) throw error;
+    repVentas = data || [];
+  } catch(e) {
+    console.warn('Error cargando ventas para reportes:', e);
+    repVentas = [];
+  }
+}
+
+/* ========== REPORTES: interacción tipo/rango ========== */
+let repTipo  = null;
+let repRango = 'personalizado';
+let repFechaInicio = null;
+let repFechaFin = null;
+let repFechasAplicadas = false;
+let repCalendarioMes = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+
+function repFechaKey(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function repFechaDesdeKey(key) {
+  const [year, month, day] = String(key).split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function repFormatoFecha(key) {
+  if (!key) return '';
+  return repFechaDesdeKey(key).toLocaleDateString('es-BO', {
+    day: '2-digit', month: '2-digit', year: 'numeric'
+  });
+}
+
+function repFechaHoy() {
+  return repFechaKey(new Date());
+}
+
+function repSeleccionarRango(inicio, fin = inicio, rango = 'personalizado') {
+  repFechaInicio = inicio;
+  repFechaFin = fin;
+  repRango = rango;
+  repFechasAplicadas = false;
+  repRenderCalendario();
+  repUpdateDateSummary();
+  repUpdateDownloadBtn();
+}
+
+function repUpdateDateSummary() {
+  const els = [
+    document.getElementById('rep-date-summary'),
+    document.getElementById('rep-date-dialog-summary')
+  ].filter(Boolean);
+  if (!els.length) return;
+  let text;
+  if (repRango === 'todo') {
+    text = 'Todas las fechas disponibles';
+  } else if (!repFechaInicio) {
+    text = 'Selecciona una fecha o un rango';
+  } else if (!repFechaFin || repFechaInicio === repFechaFin) {
+    text = `Fecha exacta: ${repFormatoFecha(repFechaInicio)}`;
+  } else {
+    text = `${repFormatoFecha(repFechaInicio)} — ${repFormatoFecha(repFechaFin)}`;
+  }
+  els.forEach(el => { el.textContent = text; });
+}
+
+function repRenderCalendario() {
+  const grid = document.getElementById('rep-calendar-grid');
+  const title = document.getElementById('rep-cal-month');
+  if (!grid || !title) return;
+
+  const year = repCalendarioMes.getFullYear();
+  const month = repCalendarioMes.getMonth();
+  title.textContent = repCalendarioMes.toLocaleDateString('es-BO', {
+    month: 'long', year: 'numeric'
+  }).replace(/^./, char => char.toUpperCase());
+
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const previousMonthDays = new Date(year, month, 0).getDate();
+  const todayKey = repFechaHoy();
+  const cells = [];
+
+  for (let i = firstDay - 1; i >= 0; i--) {
+    const date = new Date(year, month - 1, previousMonthDays - i);
+    cells.push({ date, otherMonth: true });
+  }
+  for (let day = 1; day <= daysInMonth; day++) {
+    cells.push({ date: new Date(year, month, day), otherMonth: false });
+  }
+  while (cells.length < 42) {
+    const date = new Date(year, month, cells.length - firstDay + 1);
+    cells.push({ date, otherMonth: true });
+  }
+
+  grid.innerHTML = cells.map(({ date, otherMonth }) => {
+    const key = repFechaKey(date);
+    const selected = key === repFechaInicio || key === repFechaFin;
+    const inRange = repFechaInicio && repFechaFin &&
+      key >= repFechaInicio && key <= repFechaFin;
+    return `<button type="button"
+      class="${otherMonth ? 'other-month ' : ''}${key === todayKey ? 'today ' : ''}${selected ? 'selected ' : ''}${inRange ? 'in-range' : ''}"
+      data-date="${key}" aria-label="${repFormatoFecha(key)}">${date.getDate()}</button>`;
+  }).join('');
+}
+
+function repOpenDatePicker() {
+  const popover = document.getElementById('rep-calendar-popover');
+  if (!popover) return;
+  repRenderCalendario();
+  repUpdateDateSummary();
+  popover.classList.add('open');
+  popover.setAttribute('aria-hidden', 'false');
+}
+
+function repCloseDatePicker() {
+  const popover = document.getElementById('rep-calendar-popover');
+  if (!popover) return;
+  popover.classList.remove('open');
+  popover.setAttribute('aria-hidden', 'true');
+}
+
+document.getElementById('rep-calendar-grid').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-date]');
+  if (!btn) return;
+  const key = btn.dataset.date;
+  const clickedDate = repFechaDesdeKey(key);
+  repCalendarioMes = new Date(clickedDate.getFullYear(), clickedDate.getMonth(), 1);
+  if (!repFechaInicio || (repFechaInicio && repFechaFin)) {
+    repSeleccionarRango(key, null);
+    return;
+  }
+  if (key < repFechaInicio) repSeleccionarRango(key, repFechaInicio);
+  else repSeleccionarRango(repFechaInicio, key);
+});
+
+document.getElementById('rep-cal-prev').addEventListener('click', () => {
+  repCalendarioMes = new Date(repCalendarioMes.getFullYear(), repCalendarioMes.getMonth() - 1, 1);
+  repRenderCalendario();
+});
+
+document.getElementById('rep-cal-next').addEventListener('click', () => {
+  repCalendarioMes = new Date(repCalendarioMes.getFullYear(), repCalendarioMes.getMonth() + 1, 1);
+  repRenderCalendario();
+});
+
+document.getElementById('rep-date-clear').addEventListener('click', () => {
+  repFechaInicio = null;
+  repFechaFin = null;
+  repRango = 'personalizado';
+  repFechasAplicadas = false;
+  repRenderCalendario();
+  repUpdateDateSummary();
+  repUpdateDownloadBtn();
+});
+
+document.getElementById('rep-date-apply').addEventListener('click', () => {
+  if (!repFechaInicio) {
+    showToast('Selecciona una fecha para descargar el reporte', 2500);
+    return;
+  }
+  repFechasAplicadas = true;
+  repCloseDatePicker();
+  repUpdateDateSummary();
+  repUpdateDownloadBtn();
+});
+
+document.getElementById('rep-date-trigger').addEventListener('click', repOpenDatePicker);
+document.getElementById('rep-date-close').addEventListener('click', repCloseDatePicker);
+document.getElementById('rep-calendar-popover').addEventListener('click', e => {
+  if (e.target.id === 'rep-calendar-popover') repCloseDatePicker();
+});
+
+function repGetFiltradas() {
+  if (!repFechaInicio || !repFechasAplicadas) return [];
+  const fin = repFechaFin || repFechaInicio;
+  return repVentas.filter(v => {
+    if (!v.creado_en) return false;
+    const key = repFechaKey(new Date(v.creado_en));
+    return key >= repFechaInicio && key <= fin;
+  });
+}
+
+function repUpdateDownloadBtn() {
+  const wrap = document.getElementById('rep-download-wrap');
+  const lbl  = document.getElementById('rep-download-lbl');
+  if (!wrap || !lbl) return;
+  if (repTipo && repFechasAplicadas && repFechaInicio) {
+    wrap.style.display = 'block';
+    const labels = { productos:'Ventas por Producto', cajas:'Total por Caja', detalle:'Detalle de Ventas' };
+    lbl.textContent = 'Descargar — ' + (labels[repTipo] || 'Reporte');
+  } else {
+    wrap.style.display = 'none';
+  }
+}
+
+function repResetUI() {
+  repTipo = null;
+  document.querySelectorAll('.rep-option-btn').forEach(b => b.classList.remove('active'));
+  repRango = 'personalizado';
+  repFechaInicio = null;
+  repFechaFin = null;
+  repFechasAplicadas = false;
+  const now = new Date();
+  repCalendarioMes = new Date(now.getFullYear(), now.getMonth(), 1);
+  const rangoWrap = document.getElementById('rep-rango-wrap');
+  if (rangoWrap) { rangoWrap.style.opacity = '.32'; rangoWrap.style.pointerEvents = 'none'; }
+  repCloseDatePicker();
+  repRenderCalendario();
+  repUpdateDateSummary();
+  repUpdateDownloadBtn();
+}
+
+document.querySelectorAll('.rep-option-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.rep-option-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    repTipo = btn.dataset.tipo;
+    const rangoWrap = document.getElementById('rep-rango-wrap');
+    if (rangoWrap) { rangoWrap.style.opacity = '1'; rangoWrap.style.pointerEvents = 'auto'; }
+    repOpenDatePicker();
+    repUpdateDownloadBtn();
+  });
+});
+
+document.getElementById('rep-close').removeEventListener && null;
+document.getElementById('rep-close').addEventListener('click', () => {
+  document.getElementById('reportes-modal').classList.remove('open');
+  repResetUI();
+});
+
+document.getElementById('rep-download-btn').addEventListener('click', () => {
+  if (!repVentas.length) { showToast('Sin ventas para exportar', 2500); return; }
+  const data = repGetFiltradas();
+  if (!data.length) { showToast('Sin ventas en el período seleccionado', 2500); return; }
+  window._repExportData = data;
+  if (repTipo === 'productos') document.getElementById('export-productos-btn').click();
+  else if (repTipo === 'cajas') document.getElementById('export-cajas-btn').click();
+  else if (repTipo === 'detalle') exportDetalleVentas(data);
+  window._repExportData = null;
+});
+
+/* ========== EXCEL PROFESIONAL — función base ========== */
+async function crearExcelProfesional({ titulo, subtitulo, columnas, filas, filaTotales, nombreArchivo }) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'PlideBiz POS';
+  wb.created = new Date();
+  const ws = wb.addWorksheet(subtitulo, {
+    pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true }
+  });
+  const now   = new Date();
+  const fecha = now.toLocaleDateString('es-BO', { day: '2-digit', month: 'long', year: 'numeric' });
+  const hora  = now.toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const nc    = columnas.length;
+
+  const estiloFila = (row, { bg, fg = 'FFFFFFFF', bold = false, size = 12, alto = 28, hAlign = 'center' }) => {
+    row.height = alto;
+    ws.mergeCells(row.number, 1, row.number, nc);
+    const c = row.getCell(1);
+    c.value     = typeof bg === 'object' ? bg.value : c.value;
+    c.font      = { name: 'Calibri', bold, size, color: { argb: fg } };
+    c.alignment = { horizontal: hAlign, vertical: 'middle' };
+    c.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
+  };
+
+  /* — Fila 1: Empresa — */
+  const r1 = ws.addRow(['PlideBiz POS']);
+  estiloFila(r1, { bg: 'FF0D5C2E', fg: 'FFFFFFFF', bold: true, size: 22, alto: 48 });
+
+  /* — Fila 2: Título del reporte — */
+  const r2 = ws.addRow([subtitulo.toUpperCase()]);
+  estiloFila(r2, { bg: 'FF1B8040', fg: 'FFFFFFFF', bold: true, size: 14, alto: 32 });
+
+  /* — Fila 3: Fecha y hora — */
+  const r3 = ws.addRow([`Fecha: ${fecha}     Hora: ${hora}`]);
+  estiloFila(r3, { bg: 'FFD6F0E2', fg: 'FF0D5C2E', bold: false, size: 11, alto: 22 });
+
+  /* — Fila 4: separador vacío — */
+  ws.addRow([]).height = 6;
+
+  /* — Fila 5: Encabezados de columna — */
+  const hRow = ws.addRow(columnas.map(c => c.label));
+  hRow.height = 30;
+  hRow.eachCell((cell, ci) => {
+    cell.value     = columnas[ci - 1].label;
+    cell.font      = { name: 'Calibri', bold: true, size: 12, color: { argb: 'FFFFFFFF' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D5C2E' } };
+    cell.border    = {
+      top:    { style: 'medium', color: { argb: 'FF095028' } },
+      left:   { style: 'medium', color: { argb: 'FF095028' } },
+      bottom: { style: 'medium', color: { argb: 'FF095028' } },
+      right:  { style: 'medium', color: { argb: 'FF095028' } },
+    };
+    ws.getColumn(ci).width = columnas[ci - 1].ancho || 18;
+  });
+
+  /* — Filas de datos — */
+  filas.forEach((fila, ri) => {
+    const dRow = ws.addRow(fila);
+    dRow.height = 22;
+    const bgBase = ri % 2 === 0 ? 'FFE8F5EE' : 'FFFFFFFF';
+    dRow.eachCell((cell, ci) => {
+      const col = columnas[ci - 1];
+      cell.font      = { name: 'Calibri', size: 11 };
+      cell.alignment = { horizontal: col.align || 'left', vertical: 'middle' };
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgBase } };
+      cell.border    = {
+        top:    { style: 'thin', color: { argb: 'FFBBDDC8' } },
+        left:   { style: 'thin', color: { argb: 'FFBBDDC8' } },
+        bottom: { style: 'thin', color: { argb: 'FFBBDDC8' } },
+        right:  { style: 'thin', color: { argb: 'FFBBDDC8' } },
+      };
+      if (col.formato === 'moneda') {
+        cell.numFmt = '"Bs "#,##0.00';
+        cell.font   = { name: 'Calibri', size: 11, color: { argb: 'FF0D5C2E' }, bold: true };
+      }
+      if (col.formato === 'numero') {
+        cell.numFmt = '#,##0';
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      }
+    });
+  });
+
+  /* — Fila de totales — */
+  if (filaTotales) {
+    const tRow = ws.addRow(filaTotales);
+    tRow.height = 28;
+    tRow.eachCell((cell, ci) => {
+      const col = columnas[ci - 1];
+      cell.font      = { name: 'Calibri', bold: true, size: 13, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { horizontal: col.align || 'right', vertical: 'middle' };
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0D5C2E' } };
+      cell.border    = {
+        top:    { style: 'medium', color: { argb: 'FF095028' } },
+        left:   { style: 'medium', color: { argb: 'FF095028' } },
+        bottom: { style: 'medium', color: { argb: 'FF095028' } },
+        right:  { style: 'medium', color: { argb: 'FF095028' } },
+      };
+      if (col.formato === 'moneda') cell.numFmt = '"Bs "#,##0.00';
+      if (col.formato === 'numero') cell.numFmt = '#,##0';
+    });
+  }
+
+  /* — Descargar — */
+  const buf      = await wb.xlsx.writeBuffer();
+  const blob     = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const url      = URL.createObjectURL(blob);
+  const a        = document.createElement('a');
+  const ts       = new Date().toISOString().slice(0, 10);
+  a.href         = url;
+  a.download     = `${nombreArchivo}_${ts}.xlsx`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ========== EXPORT: DETALLE DE VENTAS ========== */
+async function exportDetalleVentas(data) {
+  const rows = data || repVentas;
+  if (!rows.length) { showToast('Sin ventas para exportar', 2000); return; }
+
+  const columnas = [
+    { label: 'Fecha',        ancho: 14, align: 'center' },
+    { label: 'Hora',         ancho: 10, align: 'center' },
+    { label: 'N° Orden',     ancho: 12, align: 'center' },
+    { label: 'Caja',         ancho: 14, align: 'left'   },
+    { label: 'Cajero',       ancho: 18, align: 'left'   },
+    { label: 'Productos',    ancho: 40, align: 'left'   },
+    { label: 'QR Bs',        ancho: 12, align: 'right',  formato: 'moneda' },
+    { label: 'Efectivo Bs',  ancho: 14, align: 'right',  formato: 'moneda' },
+    { label: 'Tarjeta Bs',   ancho: 14, align: 'right',  formato: 'moneda' },
+    { label: 'Total Bs',     ancho: 14, align: 'right',  formato: 'moneda' },
+  ];
+
+  let totQR = 0, totEfectivo = 0, totTarjeta = 0, totTotal = 0;
+  const filas = rows.map(r => {
+    const dt    = r.creado_en ? new Date(r.creado_en) : null;
+    const fecha = dt ? dt.toLocaleDateString('es-BO') : '';
+    const hora  = dt ? dt.toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit' }) : '';
+    const prods = Array.isArray(r.productos)
+      ? r.productos.map(p => `${p.nombre || '?'} x${p.cantidad || 1}`).join(' | ') : '';
+    const qr  = parseFloat(r.monto_qr)       || 0;
+    const ef  = parseFloat(r.monto_efectivo) || 0;
+    const tar = parseFloat(r.monto_tarjeta)  || 0;
+    const tot = parseFloat(r.total)          || 0;
+    totQR += qr; totEfectivo += ef; totTarjeta += tar; totTotal += tot;
+    return [fecha, hora, r.numero_orden || '', r.caja || '', r.cajero_nombre || r.cajero || '', prods, qr, ef, tar, tot];
+  });
+
+  await crearExcelProfesional({
+    subtitulo:    'Detalle de Ventas',
+    columnas,
+    filas,
+    filaTotales:  ['', '', '', '', 'TOTAL GENERAL', '', totQR, totEfectivo, totTarjeta, totTotal],
+    nombreArchivo: 'detalle_ventas'
+  });
+}
+
+/* ========== EXPORT: VENTAS POR PRODUCTO ========== */
+document.getElementById('export-productos-btn').addEventListener('click', async () => {
+  const rows = window._repExportData || repVentas;
+  if (!rows.length) { showToast('Sin ventas para exportar', 2000); return; }
+
+  const porProducto = {};
+  rows.forEach(r => {
+    if (!Array.isArray(r.productos)) return;
+    r.productos.forEach(p => {
+      const k = p.nombre || '(sin nombre)';
+      if (!porProducto[k]) porProducto[k] = { qty: 0, total: 0 };
+      porProducto[k].qty   += parseInt(p.qty)    || parseInt(p.cantidad) || 1;
+      porProducto[k].total += (parseFloat(p.precio) || 0) * (parseInt(p.qty) || parseInt(p.cantidad) || 1);
+    });
+  });
+
+  const columnas = [
+    { label: '#',         ancho: 6,  align: 'center' },
+    { label: 'Producto',  ancho: 36, align: 'left'   },
+    { label: 'Cantidad',  ancho: 12, align: 'center', formato: 'numero' },
+    { label: 'Total Bs',  ancho: 16, align: 'right',  formato: 'moneda' },
+  ];
+
+  let idx = 1, grandTotal = 0;
+  const filas = Object.entries(porProducto)
+    .sort((a, b) => b[1].total - a[1].total)
+    .map(([nombre, d]) => {
+      grandTotal += d.total;
+      return [idx++, nombre, d.qty, d.total];
+    });
+
+  await crearExcelProfesional({
+    subtitulo:    'Ventas por Producto',
+    columnas,
+    filas,
+    filaTotales:  ['', 'TOTAL GENERAL', filas.reduce((s, f) => s + f[2], 0), grandTotal],
+    nombreArchivo: 'ventas_por_producto'
+  });
+});
+
+/* ========== EXPORT: TOTAL POR CAJA ========== */
+document.getElementById('export-cajas-btn').addEventListener('click', async () => {
+  const rows = window._repExportData || repVentas;
+  if (!rows.length) { showToast('Sin ventas para exportar', 2000); return; }
+
+  const porCaja = {};
+  rows.forEach(r => {
+    const k = r.caja || 'Sin caja';
+    if (!porCaja[k]) porCaja[k] = { qr: 0, efectivo: 0, tarjeta: 0, total: 0, ventas: 0 };
+    porCaja[k].qr       += parseFloat(r.monto_qr)       || 0;
+    porCaja[k].efectivo += parseFloat(r.monto_efectivo) || 0;
+    porCaja[k].tarjeta  += parseFloat(r.monto_tarjeta)  || 0;
+    porCaja[k].total    += parseFloat(r.total)           || 0;
+    porCaja[k].ventas++;
+  });
+
+  const columnas = [
+    { label: 'Caja',               ancho: 20, align: 'left'   },
+    { label: 'QR Bs',              ancho: 14, align: 'right',  formato: 'moneda' },
+    { label: 'Efectivo Bs',        ancho: 14, align: 'right',  formato: 'moneda' },
+    { label: 'Tarjeta Bs',         ancho: 14, align: 'right',  formato: 'moneda' },
+    { label: 'Total General Bs',   ancho: 18, align: 'right',  formato: 'moneda' },
+    { label: 'N° Ventas',          ancho: 12, align: 'center', formato: 'numero' },
+  ];
+
+  let totQR = 0, totEf = 0, totTar = 0, totTot = 0, totVentas = 0;
+  const filas = Object.entries(porCaja).map(([caja, d]) => {
+    totQR += d.qr; totEf += d.efectivo; totTar += d.tarjeta; totTot += d.total; totVentas += d.ventas;
+    return [caja, d.qr, d.efectivo, d.tarjeta, d.total, d.ventas];
+  });
+
+  await crearExcelProfesional({
+    subtitulo:    'Total por Caja',
+    columnas,
+    filas,
+    filaTotales:  ['TOTAL GENERAL', totQR, totEf, totTar, totTot, totVentas],
+    nombreArchivo: 'total_por_caja'
+  });
+});
+
+/* ========== ÓRDENES ========== */
+let ordFiltroCaja   = 'mia';
+let ordVentas       = [];
+
+function abrirOrdenes() {
+  document.getElementById('ordenes-modal').classList.add('open');
+  loadOrdenes();
+}
+document.getElementById('ord-close').addEventListener('click', () =>
+  document.getElementById('ordenes-modal').classList.remove('open'));
+
+
+document.getElementById('ord-filter-mia').addEventListener('click',    () => { ordFiltroCaja='mia';    syncOrdFilters(); loadOrdenes(); });
+document.getElementById('ord-filter-todas').addEventListener('click',  () => {
+  if (!esCaja1()) return;
+  ordFiltroCaja='todas'; syncOrdFilters(); loadOrdenes();
+});
+document.getElementById('ord-search').addEventListener('input', renderOrdenes);
+
+function syncOrdFilters() {
+  document
+    .getElementById('ord-filter-mia')
+    .classList.toggle('active', ordFiltroCaja === 'mia');
+
+  document
+    .getElementById('ord-filter-todas')
+    .classList.toggle('active', ordFiltroCaja === 'todas');
+}
+async function loadOrdenes() {
+  const listEl = document.getElementById('ord-list');
+  listEl.innerHTML = '<div class="ord-empty">Cargando órdenes…</div>';
+  try {
+    const s = getCurrentSession();
+    let q = supabaseClient.from('ventas').select('*').order('creado_en', { ascending: false });
+   
+    if (!esCaja1(s)) {
+      ordFiltroCaja = 'mia';
+      q = q.eq('caja', s?.caja || '');
+    }
+    // Always load ALL orders so global numbering is correct; caja filter is client-side
+    const { data, error } = await q.limit(500);
+    if (error) throw error;
+    ordVentas = data || [];
+    renderOrdenes();
+  } catch(e) {
+    listEl.innerHTML = `<div class="ord-empty" style="color:#ff6b6b;">Error: ${e.message}</div>`;
+  }
+}
+
+function renderOrdenes() {
+  const listEl    = document.getElementById('ord-list');
+  const countEl   = document.getElementById('ord-count-label');
+  const q         = document.getElementById('ord-search').value.toLowerCase().trim();
+  // Client-side caja filter. La referencia estable sale del ID de Supabase,
+  // no de la posición de la fila ni del total de ventas cargadas.
+  let rows = ordVentas;
+  if (ordFiltroCaja === 'mia') {
+    const _s = getCurrentSession();
+    if (_s) rows = rows.filter(r => r.caja === _s.caja);
+  }
+  if (q) {
+    const qLimpio = q.replace('#', '').trim();
+
+    rows = rows.filter(r => {
+      const numeroComanda = String(getOrderReference(r.id));
+
+      return (
+        numeroComanda === qLimpio ||
+        (r.cajero_nombre || '').toLowerCase().includes(q) ||
+        (r.caja || '').toLowerCase().includes(q) ||
+        (r.metodo_pago || '').toLowerCase().includes(q) ||
+        JSON.stringify(r.productos || []).toLowerCase().includes(q)
+      );
+    });
+  }
+  const total   = rows.length;
+  const activas = rows.filter(r => !r.anulado).length;
+  countEl.textContent = `${total} orden${total!==1?'es':''} — ${activas} activa${activas!==1?'s':''}`;
+
+  if (!rows.length) {
+    listEl.innerHTML = '<div class="ord-empty">Sin órdenes para mostrar</div>';
+    return;
+  }
+
+  // Determine which cajas can anular
+  const _sess = getCurrentSession();
+  const _canAnular = esCaja1(_sess);
+
+  listEl.innerHTML = rows.map((r, i) => {
+    const num       = getOrderReference(r.id);
+    const dt     = new Date(r.creado_en);
+    const hora   = dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    const fecha  = dt.toLocaleDateString([], {day:'2-digit', month:'2-digit'});
+    const prods = Array.isArray(r.productos)
+    ? r.productos.map(p => `
+        <div class="ord-product-row">
+          <span class="ord-product-qty">${p.qty}</span>
+          <span class="ord-product-name">${p.nombre}</span>
+        </div>
+      `).join('')
+    : '—';
+    const estadoCls   = r.anulado ? 'fail' : 'ok';
+    const estadoLabel = r.anulado ? 'ANULADA' : 'ACTIVA';
+    const anulaBtnHtml = !_canAnular
+      ? ''
+      : r.anulado
+        ? `<button class="ord-btn void" disabled>Anulada</button>`
+        : `<button class="ord-btn void" onclick="anularOrden('${r.id}', this)">ANULAR</button>`;
+    return `
+      <div class="ord-card ${r.anulado ? 'anulada' : ''}">
+        <div class="ord-left">
+        <div class="ord-top">
+          <div class="ord-id-block">
+            <span class="ord-id-label">COMANDA</span>
+            <span class="ord-num">#${num}</span>
+          </div>
+
+          <span class="ord-estado-badge ${estadoCls}">
+            ${estadoLabel}
+          </span>
+
+          <div class="ord-order-meta">
+            <span>${r.caja || '—'}</span>
+            <span>${fecha} · ${hora}</span>
+          </div>
+        </div>
+         <div class="ord-meta">
+           CAJERO: ${r.cajero_nombre || r.cajero || '—'}
+         </div>
+          <div class="ord-prods">${prods}</div>
+          <div class="ord-total-row">
+            <span class="ord-metodo">${(r.metodo_pago||'—').toUpperCase()}</span>
+            <span class="ord-total">Bs ${(+r.total).toFixed(2)}</span>
+          </div>
+        </div>
+        <div class="ord-right">
+         <button class="ord-btn print" onclick="reimprimirOrden('${r.id}')">
+           IMPRIMIR
+         </button>
+          ${anulaBtnHtml}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function anularOrden(id, btn) {
+  if (!esCaja1()) {
+    showToast('Solo Caja 1 puede anular órdenes', 2500);
+    return;
+  }
+  if (!id || id === 'null' || id === 'undefined') {
+    showToast('⚠️ Esta orden no tiene ID en Supabase'); return;
+  }
+  const ok = await showConfirm({ msg: '¿Anular esta orden?\nEsta acción no se puede deshacer.', icon: '🗑', confirmText: 'Sí, anular', confirmCls: 'danger' });
+  if (!ok) return;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const { error } = await supabaseClient.from('ventas').update({ anulado: true }).eq('id', id);
+    if (error) throw error;
+    showToast('🗑 Orden anulada correctamente', 2200);
+    loadOrdenes();
+  } catch(e) {
+    btn.disabled = false; btn.innerHTML = '🗑 Anular';
+    showToast('Error al anular: ' + e.message, 3000);
+  }
+}
+
+function reimprimirOrden(id) {
+  const r = ordVentas.find(o => String(o.id) === String(id));
+  if (!r) { showToast('Orden no encontrada', 2000); return; }
+
+  const num       = getOrderReference(r.id);
+  const dt        = new Date(r.creado_en);
+  const comanda = crearDatosComanda(
+    String(r.metodo_pago || '—').toUpperCase(),
+    num,
+    r.productos,
+    { caja: r.caja },
+    dt
+  );
+  // La reimpresión usa exactamente el mismo generador ESC/POS que una venta
+  // nueva. No se crea un HTML alternativo: así nunca reaparece el diseño viejo.
+  imprimirComandaUsb(comanda).then(() => {
+    showToast('✅ Comanda reimpresa', 2500);
+  }).catch(error => {
+    console.warn('No se pudo reimprimir la orden:', error);
+    showToast(`⚠️ ${error.message || 'La reimpresión falló'}`, 4500);
+  });
+}
+
+/* ========== MONITOR DE CAJAS ========== */
+let monitorInterval = null;
+let monitorTurnos   = [];
+let crTurnoActivo   = null;
+
+function abrirMonitor() {
+  const _ms = getCurrentSession();
+  if (!_ms || !(_ms.caja && _ms.caja.replace(/[^0-9]/g,'') === '1')) {
+    showToast('⚠️ Solo Caja 1 puede ver el monitor', 2500); return;
+  }
+  if (monitorInterval) clearInterval(monitorInterval);
+  cajaShowStep('caja-step-monitor');
+  document.getElementById('caja-modal').classList.add('open');
+  loadCajasAbiertas();
+  monitorInterval = setInterval(loadCajasAbiertas, 15000);
+}
+
+function cerrarMonitorStep() {
+  if (monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
+  document.getElementById('caja-modal').classList.remove('open');
+}
+
+async function loadCajasAbiertas() {
+  const list = document.getElementById('monitor-list');
+  if (!supabaseClient) {
+    list.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px;">Sin conexión a Supabase</div>';
+    return;
+  }
+  try {
+    const { data, error } = await supabaseClient
+      .from('turnos_caja')
+      .select('*')
+      .eq('estado', 'abierta')
+      .order('abierta_en', { ascending: true });
+    if (error) throw error;
+    monitorTurnos = data || [];
+    renderMonitorList(monitorTurnos);
+  } catch(e) {
+    list.innerHTML = '<div style="text-align:center;color:#ff6b6b;padding:20px;font-size:13px;">Error al cargar cajas</div>';
+  }
+}
+
+function renderMonitorList(turnos) {
+  const list = document.getElementById('monitor-list');
+  const s = getCurrentSession();
+  if (!turnos.length) {
+    list.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:30px;font-size:13px;">🔒 No hay cajas abiertas</div>';
+    return;
+  }
+  list.innerHTML = turnos.map((t, i) => {
+    const desde = t.abierta_en
+      ? new Date(t.abierta_en).toLocaleTimeString('es-BO', {hour:'2-digit', minute:'2-digit'})
+      : '—';
+    const esMia = s && t.cajero === s.usuario;
+    const esAdminMonitor = !!(s?.admin);
+    return `<div class="monitor-card">
+      <div class="monitor-card-left">
+        <div class="monitor-card-caja">${t.caja || '—'}</div>
+        <div class="monitor-card-meta">${t.nombre || t.cajero} · desde ${desde}</div>
+        <div class="monitor-card-ap">Apertura: Bs ${parseFloat(t.monto_apertura||0).toFixed(2)}</div>
+      </div>
+      <div>${(esMia && !esAdminMonitor)
+        ? '<span class="monitor-card-badge">Mi caja</span>'
+        : `<button class="monitor-card-btn" onclick="initCierreRemoto(${i})">Cerrar →</button>`
+      }</div>
+    </div>`;
+  }).join('');
+}
+
+async function initCierreRemotoDesdeOverview(caja) {
+  if (!supabaseClient) { showToast('⚠️ Sin conexión a base de datos', 2000); return; }
+  try {
+    const { data: t } = await supabaseClient
+      .from('turnos_caja').select('*').eq('caja', caja).eq('estado', 'abierta')
+      .order('abierta_en', { ascending: false }).limit(1).maybeSingle();
+    if (!t) { showToast('⚠️ No hay turno abierto para esa caja', 2500); return; }
+    let idx = monitorTurnos.findIndex(mt => mt.id === t.id);
+    if (idx < 0) { monitorTurnos.push(t); idx = monitorTurnos.length - 1; }
+    initCierreRemoto(idx);
+  } catch(e) { showToast('⚠️ Error al cargar turno', 2000); }
+}
+
+async function initCierreRemoto(idx) {
+  const t = monitorTurnos[idx];
+  if (!t) return;
+  crTurnoActivo = t;
+  // Buscar nombre de la cajera en la tabla cajeras por usuario
+  let cajeroNombre = t.cajero_nombre || t.nombre || t.cajero || '—';
+  if (supabaseClient && t.cajero && !t.cajero_nombre && !t.nombre) {
+    try {
+      const { data: cajData } = await supabaseClient.from('cajeras').select('nombre').eq('usuario', t.cajero).single();
+      if (cajData?.nombre) cajeroNombre = cajData.nombre;
+    } catch(_){}
+  }
+  crTurnoActivo.cajeroNombre = cajeroNombre;
+  document.getElementById('cr-caja-titulo').textContent = t.caja || 'Caja';
+  document.getElementById('cr-caja-nombre').textContent = `${cajeroNombre} — ${t.caja}`;
+  const desde = t.abierta_en
+    ? new Date(t.abierta_en).toLocaleString('es-BO', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})
+    : '—';
+  document.getElementById('cr-caja-desde').textContent = `Abierta desde ${desde}`;
+  document.getElementById('cr-ef').value = '';
+  document.getElementById('cr-qr2').value = '';
+  document.getElementById('cr-tar2').value = '';
+  document.getElementById('cr-result-grid').style.display = 'none';
+  document.getElementById('cr-btn-confirmar').style.display = 'none';
+  cajaShowStep('caja-step-cierre-remoto');
+}
+
+document.getElementById('cr-btn-calcular').addEventListener('click', async () => {
+  if (!crTurnoActivo) return;
+  const t = crTurnoActivo;
+  const efReal  = Math.round(parseFloat(document.getElementById('cr-ef').value)   || 0);
+  const qrReal  = Math.round(parseFloat(document.getElementById('cr-qr2').value)  || 0);
+  const tarReal = Math.round(parseFloat(document.getElementById('cr-tar2').value) || 0);
+  const apertura = Math.round(parseFloat(t.monto_apertura) || 0);
+  let vEf = 0, vQr = 0, vTar = 0;
+  if (supabaseClient && t.id) {
+    try {
+      const { data, error } = await supabaseClient
+        .from('ventas')
+        .select('monto_efectivo,monto_qr,monto_tarjeta')
+        .eq('turno_id', t.id)
+        .eq('anulado', false);
+
+      if (error) throw error;
+
+      (data || []).forEach(v => {
+        vEf  += parseFloat(v.monto_efectivo) || 0;
+        vQr  += parseFloat(v.monto_qr) || 0;
+        vTar += parseFloat(v.monto_tarjeta) || 0;
+      });
+
+    } catch (e) {
+      console.warn('Error consultando ventas del cierre remoto:', e);
+    }
+  }
+  vEf = Math.round(vEf);
+  vQr = Math.round(vQr);
+  vTar = Math.round(vTar);
+  const efEsp = apertura + vEf;
+  const difEf  = efReal - efEsp;
+  const difQr  = qrReal - vQr;
+  const difTar = tarReal - vTar;
+  const ok = d => Math.abs(d) < 1;
+  const todoCuadra = ok(difEf) && ok(difQr) && ok(difTar);
+  const fmtD = d => ok(d)
+    ? '<span class="val ok">✓ Cuadra</span>'
+    : (d > 0 ? `<span class="val sobra">+Bs ${fmt(Math.abs(d))} SOBRA</span>`
+             : `<span class="val falta">-Bs ${fmt(Math.abs(d))} FALTA</span>`);
+  const grid = document.getElementById('cr-result-grid');
+  grid.innerHTML = `
+    <div class="caja-result-row"><span class="lbl">💵 Ef. esperado</span><span class="val">Bs ${fmt(efEsp)}</span></div>
+    <div class="caja-result-row"><span class="lbl">💵 Ef. contado</span><span class="val">Bs ${fmt(efReal)}</span></div>
+    <div class="caja-result-row"><span class="lbl">Diferencia</span>${fmtD(difEf)}</div>
+    <hr style="border:none;border-top:1px solid rgba(160,140,255,0.15);">
+    <div class="caja-result-row"><span class="lbl">📱 QR esperado</span><span class="val">Bs ${fmt(vQr)}</span></div>
+    <div class="caja-result-row"><span class="lbl">📱 QR contado</span><span class="val">Bs ${fmt(qrReal)}</span></div>
+    <div class="caja-result-row"><span class="lbl">Diferencia</span>${fmtD(difQr)}</div>
+    <hr style="border:none;border-top:1px solid rgba(160,140,255,0.15);">
+    <div class="caja-result-row"><span class="lbl">💳 Tarjeta esp.</span><span class="val">Bs ${fmt(vTar)}</span></div>
+    <div class="caja-result-row"><span class="lbl">💳 Tarjeta cont.</span><span class="val">Bs ${fmt(tarReal)}</span></div>
+    <div class="caja-result-row"><span class="lbl">Diferencia</span>${fmtD(difTar)}</div>
+    <div class="caja-result-row caja-result-total">
+      <span class="lbl">Estado</span>
+      <span class="val ${todoCuadra ? 'ok' : 'falta'}">${todoCuadra ? '✓ Cuadra' : '⚠ Revisar'}</span>
+    </div>`;
+  grid.style.display = 'flex';
+  const btn = document.getElementById('cr-btn-confirmar');
+  btn.dataset.efEsp  = efEsp;
+  btn.dataset.vQr    = vQr;
+  btn.dataset.vTar   = vTar;
+  btn.dataset.difEf  = difEf;
+  btn.dataset.difQr  = difQr;
+  btn.dataset.difTar = difTar;
+  btn.style.display  = 'block';
+});
+document.getElementById('cr-btn-confirmar').addEventListener('click', async () => {
+  if (!crTurnoActivo) return;
+
+  const t = crTurnoActivo;
+  const btn = document.getElementById('cr-btn-confirmar');
+
+  btn.disabled = true;
+
+  const efReal  = Math.round(
+    parseFloat(document.getElementById('cr-ef').value) || 0
+  );
+
+  const qrReal  = Math.round(
+    parseFloat(document.getElementById('cr-qr2').value) || 0
+  );
+
+  const tarReal = Math.round(
+    parseFloat(document.getElementById('cr-tar2').value) || 0
+  );
+
+  const cerradaPor =
+    getCurrentSession()?.usuario || '—';
+
+  const efEsp  =
+    Math.round(parseFloat(btn.dataset.efEsp) || 0);
+
+  const vQr =
+    Math.round(parseFloat(btn.dataset.vQr) || 0);
+
+  const vTar =
+    Math.round(parseFloat(btn.dataset.vTar) || 0);
+
+  const difEf =
+    Math.round(parseFloat(btn.dataset.difEf) || 0);
+
+  const difQr =
+    Math.round(parseFloat(btn.dataset.difQr) || 0);
+
+  const difTar =
+    Math.round(parseFloat(btn.dataset.difTar) || 0);
+
+  const todoCuadra =
+    Math.abs(difEf) < 1 &&
+    Math.abs(difQr) < 1 &&
+    Math.abs(difTar) < 1;
+
+  if (!supabaseClient || !t.id) {
+    showToast(
+      '⚠️ No se pudo cerrar: sin ID de turno',
+      3000
+    );
+
+    btn.disabled = false;
+    return;
+  }
+
+  try {
+    const ventasEfectivo =
+      efEsp - parseFloat(t.monto_apertura || 0);
+
+    const { data: cierreGuardado, error } =
+      await supabaseClient.rpc(
+        'cerrar_turno_caja',
+        {
+          p_turno_id: t.id,
+
+          p_monto_cierre_efectivo: efReal,
+          p_monto_cierre_qr: qrReal,
+          p_monto_cierre_tarjeta: tarReal,
+
+          p_ventas_efectivo: ventasEfectivo,
+          p_ventas_qr: vQr,
+          p_ventas_tarjeta: vTar,
+
+          p_diferencia_efectivo: difEf,
+          p_diferencia_qr: difQr,
+          p_diferencia_tarjeta: difTar
+        }
+      );
+
+    if (error) throw error;
+
+    if (!cierreGuardado) {
+      throw new Error(
+        'Supabase no confirmó el cierre remoto'
+      );
+    }
+
+  } catch (e) {
+    console.error('Error cierre remoto:', e);
+
+    showToast(
+      '⚠️ No se pudo confirmar el cierre remoto: ' +
+      (e.message || 'error de conexión'),
+      4500
+    );
+
+    btn.disabled = false;
+    return;
+  }
+
+  
+  // Imprimir cierre remoto
+  const fmtDifP = d => d > 0
+    ? `SOBRA Bs ${fmt(Math.abs(d))}`
+    : `FALTA Bs ${fmt(Math.abs(d))}`;
+  const difLineP = d => Math.abs(d) < 1
+    ? ''
+    : `<div class="pc-dif"><span>DIFERENCIA</span><span>${fmtDifP(d)}</span></div>`;
+  const totEsp  = Math.round(efEsp + vQr + vTar);
+  const totCont = Math.round(efReal + qrReal + tarReal);
+  const ahora   = new Date();
+  const oldPA = document.getElementById('print-area'); if (oldPA) oldPA.remove();
+  const oldST = document.getElementById('print-style-tag'); if (oldST) oldST.remove();
+  const pStyle = document.createElement('style');
+  pStyle.id = 'print-style-tag';
+  pStyle.textContent = `@media print {
+    @page{size:A4 portrait;margin:0;}
+    html{height:auto!important;width:210mm!important;}
+    body{height:auto!important;min-height:0!important;overflow:visible!important;background:#fff!important;margin:0!important;padding:0!important;width:210mm!important;}
+    body::after{display:none!important;}
+    body > *{display:none!important;}
+    #print-area{display:block!important;width:180mm!important;font-family:Arial,Helvetica,sans-serif;font-weight:700;color:#000;background:#fff;margin:12mm auto;padding:0 8mm 12mm;box-sizing:border-box;text-transform:uppercase;}
+    #print-area .pc-brand{text-align:center;font-size:18pt;font-weight:900;letter-spacing:.04em;margin-bottom:2pt;padding-top:2pt;}
+    #print-area .pc-titulo{text-align:center;font-size:11pt;font-weight:900;border-top:2.5px solid #000;border-bottom:2.5px solid #000;padding:3pt 0;margin-bottom:4pt;}
+    #print-area .pc-info{font-size:10pt;font-weight:900;margin:2pt 0;}
+    #print-area .pc-ticket-meta{display:flex;align-items:baseline;justify-content:space-between;gap:2mm;width:100%;margin:2pt 0 4pt;font-size:8pt;font-weight:900;line-height:1.1;}
+    #print-area .pc-ticket-meta .pc-datetime{font-size:8pt;font-weight:700;white-space:nowrap;text-align:right;}
+    #print-area .pc-divider{border:none;border-top:1.5px dashed #000;margin:4pt 0;}
+    #print-area .pc-metodo{font-size:11pt;font-weight:900;border-bottom:1px solid #ddd;padding:3pt 0 2pt;margin-bottom:1pt;}
+    #print-area .pc-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:2mm;align-items:baseline;font-size:10pt;font-weight:900;padding:1pt 0;width:100%;min-width:0;}
+    #print-area .pc-row>span:first-child{min-width:0;overflow-wrap:anywhere;}
+    #print-area .pc-row>span:last-child{white-space:nowrap;text-align:right;}
+    #print-area .pc-dif{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:2mm;align-items:baseline;font-size:11pt;font-weight:900;padding:2pt 0 4pt;width:100%;min-width:0;}
+    #print-area .pc-dif>span:first-child{min-width:0;overflow-wrap:anywhere;}
+    #print-area .pc-dif>span:last-child{white-space:nowrap;text-align:right;}
+    #print-area .pc-total-bloque{border-top:2.5px solid #000;border-bottom:2.5px solid #000;padding:4pt 0;margin:6pt 0;}
+    #print-area .pc-total-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:2mm;align-items:baseline;font-size:11pt;font-weight:900;min-width:0;}
+    #print-area .pc-total-row>span:first-child{min-width:0;overflow-wrap:anywhere;}
+    #print-area .pc-total-row>span:last-child{white-space:nowrap;text-align:right;}
+  }`;
+  document.head.appendChild(pStyle);
+  const pa = document.createElement('div');
+  pa.id = 'print-area';
+  pa.dataset.printFormat = 'a4';
+  pa.style.display = 'none';
+  pa.innerHTML = `
+    <div class="pc-brand">MAMA ORURO</div>
+    <div class="pc-titulo">CIERRE DE CAJA</div>
+    <div class="pc-ticket-meta">
+      <span>CAJA: ${formatReceiptCaja(t.caja)}</span>
+      <span class="pc-datetime">${formatReceiptDateTime(ahora)}</span>
+    </div>
+    <hr class="pc-divider">
+     <div class="pc-metodo">EFECTIVO</div>
+    <div class="pc-row"><span>ESPERADO</span><span>Bs ${fmt(efEsp)}</span></div>
+    <div class="pc-row"><span>CONTADO</span><span>Bs ${fmt(efReal)}</span></div>
+    ${difLineP(difEf)}
+    <hr class="pc-section-divider">
+     <div class="pc-metodo">QR</div>
+    <div class="pc-row"><span>ESPERADO</span><span>Bs ${fmt(vQr)}</span></div>
+    <div class="pc-row"><span>CONTADO</span><span>Bs ${fmt(qrReal)}</span></div>
+    ${difLineP(difQr)}
+    <hr class="pc-section-divider">
+     <div class="pc-metodo">TARJETA</div>
+    <div class="pc-row"><span>ESPERADO</span><span>Bs ${fmt(vTar)}</span></div>
+    <div class="pc-row"><span>CONTADO</span><span>Bs ${fmt(tarReal)}</span></div>
+    ${difLineP(difTar)}
+    <hr class="pc-divider">
+    <div class="pc-total-bloque">
+      <div class="pc-total-row"><span>TOTAL ESPERADO</span><span>Bs ${fmt(totEsp)}</span></div>
+      <div class="pc-total-row" style="margin-top:2pt;"><span>TOTAL CONTADO</span><span>Bs ${fmt(totCont)}</span></div>
+    </div>`;
+  document.body.appendChild(pa);
+  imprimirTicketCuandoEsteListo().catch(error => {
+    console.warn('No se pudo imprimir el cierre remoto:', error);
+    showToast('El cierre se guardó, pero la impresión falló', 3500);
+  });
+
+  btn.disabled = false;
+  crTurnoActivo = null;
+  showToast(`🔒 ${t.caja} cerrada correctamente`, 3000);
+  setTimeout(() => { cajaShowStep('caja-step-monitor'); loadCajasAbiertas(); }, 400);
+});
+
+document.getElementById('cr-btn-volver').addEventListener('click', () => cajaShowStep('caja-step-monitor'));
+document.getElementById('monitor-close-btn').addEventListener('click', cerrarMonitorStep);
+document.getElementById('monitor-refresh-btn').addEventListener('click', loadCajasAbiertas);
+
+// Detener polling cuando el modal de caja se cierra por otros medios
+document.getElementById('caja-step1-cancel').addEventListener('click', () => {
+  if (monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
+});
+document.getElementById('caja-cierre-cancel').addEventListener('click', () => {
+  if (monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
+});
+
+/* ========== SYNC TURNO EN TIEMPO REAL ========== */
+// Cada 5 seg verifica en Supabase si el turno sigue abierto.
+// Si otra persona lo cerró remotamente, limpia el caché local y actualiza el dock.
+let _turnoSyncInterval = null;
+
+async function syncTurnoEstado() {
+  if (!supabaseClient) return;
+  const s = getCurrentSession();
+  const turno = getTurno();
+  if (!s || !turno || turno.estado !== 'abierta') return;
+  try {
+    const { data, error } = await supabaseClient
+      .from('turnos_caja')
+      .select('estado')
+      .eq('id', turno.id)
+      .maybeSingle();
+    if (error) return;
+    // Si Supabase dice cerrado (o no existe) pero local dice abierto → corregir
+    if (!data || data.estado !== 'abierta') {
+      clearTurno();
+      updateDockCajaLabel();
+      showToast('🔒 Caja cerrada por otro usuario', 3000);
+    }
+  } catch(_) {}
+}
+
+function startTurnoSync() {
+  if (_turnoSyncInterval) clearInterval(_turnoSyncInterval);
+  _turnoSyncInterval = setInterval(syncTurnoEstado, 5000);
+}
+
+function stopTurnoSync() {
+  if (_turnoSyncInterval) { clearInterval(_turnoSyncInterval); _turnoSyncInterval = null; }
+}
+
+/* ========== INIT ========== */
+initSession();
+updateOrderNumberDisplay();
+startTurnoSync();

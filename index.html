@@ -1,70 +1,737 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>Juego Llama</title>
-
-  <link rel="preload" as="audio" href="/assets/llama/supermariobros.mp3">
-  <link rel="preload" as="audio" href="/assets/llama/saltosonido.mp3">
-  <link rel="stylesheet" href="/style.css">
-  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
-
-  <script>
-    (function () {
-      function unlockAudio() {
-        var AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return;
-        var ctx = new AC();
-        var buf = ctx.createBuffer(1, 1, 22050);
-        var src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(ctx.destination);
-        src.start(0);
-        window._phaserAudioCtx = ctx;
-        document.removeEventListener('touchstart', unlockAudio, true);
-        document.removeEventListener('touchend',   unlockAudio, true);
-        document.removeEventListener('click',      unlockAudio, true);
-      }
-      document.addEventListener('touchstart', unlockAudio, { capture: true, once: true, passive: true });
-      document.addEventListener('touchend',   unlockAudio, { capture: true, once: true, passive: true });
-      document.addEventListener('click',      unlockAudio, { capture: true, once: true, passive: true });
-    })();
-  </script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=overlays-content">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  
+  <!-- iOS / Apple -->
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <!-- Favicon navegador -->
+  <link rel="shortcut icon" href="favicon.ico" type="image/x-icon">
+  <!-- PWA manifest -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#000000">
+  
+<title>PlideBiz POS</title>
+<link rel="stylesheet" href="./style.css">
 </head>
 <body>
-  <div id="game-wrapper">
-    <div id="game-container"></div>
+<div class="bg-shape bg-c1"></div>
+<div class="bg-shape bg-c2"></div>
+<div class="bg-shape bg-c3"></div>
+<div class="bg-shape bg-c4"></div>
+<div class="bg-shape bg-c5"></div>
+<div class="bg-shape bg-c6"></div>
+<div class="bg-shape bg-c7"></div>
+<div class="bg-shape bg-c8"></div>
+<div class="bg-shape bg-c9"></div>
+<div class="bg-shape bg-c10"></div>
+<div class="bg-shape bg-sq"></div>
+<div class="bg-shape bg-tri"></div>
+<div class="blob blob1"></div>
+<div class="blob blob2"></div>
+<div class="blob blob3"></div>
+<div class="blob4"></div>
 
-    <!-- Controles táctiles: visibles en móvil portrait y landscape -->
-    <div id="mobile-controls">
-
-      <!-- D-pad izquierdo: ← → para moverse + ↑ ↓ para menú -->
-      <div id="dpad">
-        <button id="btn-up"    class="ctrl-btn ctrl-sm" aria-label="Arriba">▲</button>
-        <div id="dpad-lr">
-          <button id="btn-left"  class="ctrl-btn" aria-label="Izquierda">◀</button>
-          <button id="btn-right" class="ctrl-btn" aria-label="Derecha">▶</button>
-        </div>
-        <button id="btn-down"  class="ctrl-btn ctrl-sm" aria-label="Abajo">▼</button>
+<div id="app">
+  <!-- TOP BAR: search icon + logout -->
+  <div id="top-bar">
+    <div id="search-bar" role="search">
+      <button id="search-icon-btn" aria-label="Buscar" tabindex="0">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4"/>
+        </svg>
+      </button>
+      <input id="search" type="search" placeholder="Buscar producto…" autocomplete="off" name="buscar-x7k" aria-autocomplete="none" spellcheck="false">
+      <button id="search-clear">✕</button>
+      <button id="search-done" type="button" aria-label="Ocultar teclado y terminar selección">Listo</button>
+    </div>
+    <div id="top-user" style="display:none;">
+      <div class="user-badge-info">
+        <div class="user-badge-name" id="badge-nombre">—</div>
+        <div class="user-badge-caja" id="badge-caja">Sin sesión</div>
       </div>
-
-      <!-- Botones derecha: START (menú) + B (fuego) + A (salto) -->
-      <div id="action-btns">
-        <button id="btn-start" class="ctrl-btn ctrl-start" aria-label="Start">START</button>
-        <div id="action-ab">
-          <button id="btn-fire" class="ctrl-btn ctrl-b ctrl-b--disabled" aria-label="Fuego">B</button>
-          <button id="btn-jump" class="ctrl-btn ctrl-a"                  aria-label="Saltar">A</button>
-        </div>
-      </div>
-
+      <button class="logout-btn" id="logout-btn">Cerrar sesión</button>
     </div>
   </div>
 
-  <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/phaser@3.90.0/dist/phaser.min.js"></script>
-  <script type="module" src="/script.js"></script>
+  <section class="glass" id="products-panel">
+    <div id="product-grid"></div>
+  </section>
+
+  <aside class="glass" id="order-panel">
+    <div class="order-hd">
+      <div style="display:flex;align-items:center;gap:9px">
+        <span class="order-title">PEDIDO</span>
+        <span class="order-badge" id="order-count">0</span>
+
+        <button
+          type="button"
+          id="order-note-btn"
+          class="order-note-btn"
+          aria-label="Agregar nota al pedido"
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="8" y1="13" x2="16" y2="13"/>
+            <line x1="8" y1="17" x2="14" y2="17"/>
+          </svg>
+        </button>
+      </div>
+      <span class="order-clear" id="order-clear">✕ Limpiar</span>
+    </div>
+    <div class="order-num-row">
+      ORDEN <span id="order-number-display" class="order-num-val">#—</span>
+    </div>
+
+    <div id="order-list">
+      <div class="order-empty" id="order-empty">
+        <div class="order-empty-icon">🛒</div>
+        <div>Agrega productos<br>para empezar</div>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+
+    <div class="order-tools-row">
+
+    <div class="order-note-wrap">
+      <div class="order-note-label">NOTA DEL PEDIDO</div>
+
+      <textarea
+        id="order-note"
+        class="order-note"
+        rows="2"
+        maxlength="180"
+        placeholder="Ej: sin hielo, entregar primero..."
+      ></textarea>
+    </div>
+    <div class="order-discount-wrap">
+
+      <div class="order-discount-top">
+        <div class="order-discount-label">DESCUENTO</div>
+      </div>
+
+      <div class="order-discount-entry">
+        <input
+          type="number"
+          id="order-discount-value"
+          class="order-discount-input"
+          placeholder="0"
+          min="0"
+          step="1"
+          inputmode="numeric"
+        >
+      </div>
+
+      <div class="order-discount-types">
+        <button type="button" class="discount-type active" data-discount-type="bs">Bs</button>
+        <button type="button" class="discount-type" data-discount-type="porcentaje">%</button>
+      </div>
+
+      <div class="order-discount-result" id="order-discount-result"></div>
+
+        </div>
+
+        <div class="totals">
+          
+
+          <div class="tot-row">
+            <span class="tot-lbl">ÍTEMS</span>
+            <span class="tot-val" id="items-ct">0</span>
+          </div>
+
+          <div class="tot-divider"></div>
+
+          <div class="tot-main">
+            <span class="tot-main-lbl">TOTAL</span>
+            <span class="tot-main-val" id="total-val">Bs 0</span>
+          </div>
+        </div>
+
+    </div>
+    <button class="btn-checkout" id="btn-checkout" disabled>💳 COBRAR PEDIDO</button>
+  </aside>
+</div>
+
+<div id="dock-wrap">
+  <div class="dock" id="dock"></div>
+</div>
+
+<div id="edit-modal">
+  <div class="edit-panel">
+    <div class="ep-title">✏️ Editar ícono</div>
+    <div class="ep-field">
+      <div class="ep-label">Nombre</div>
+      <input class="ep-input" id="ep-name" type="text">
+    </div>
+    <div class="ep-field">
+      <div class="ep-label">URL del ícono</div>
+      <input class="ep-input" id="ep-icon" type="text">
+    </div>
+    <div class="ep-field">
+      <div class="ep-label">URL destino</div>
+      <input class="ep-input" id="ep-url" type="text">
+    </div>
+    <div class="ep-actions">
+      <button class="ep-btn cancel" id="ep-cancel">Cancelar</button>
+      <button class="ep-btn save" id="ep-save">Guardar</button>
+    </div>
+  </div>
+</div>
+  <div id="order-note-modal">
+    <div class="order-note-modal-panel">
+
+      <div class="order-note-modal-head">
+        <div class="order-note-modal-title">NOTA DEL PEDIDO</div>
+
+        <button
+          type="button"
+          id="order-note-close"
+          class="order-note-modal-close"
+          aria-label="Cerrar nota"
+        >
+          ×
+        </button>
+      </div>
+
+      <textarea
+        id="order-note-modal-input"
+        class="order-note-modal-input"
+        rows="4"
+        maxlength="180"
+        placeholder="Ej: sin hielo, entregar primero..."
+      ></textarea>
+
+      <button
+        type="button"
+        id="order-note-save"
+        class="order-note-modal-save"
+      >
+        GUARDAR NOTA
+      </button>
+
+    </div>
+  </div>
+<div id="checkout-modal">
+  <div class="co-panel">
+    <div class="co-icon" style="color: var(--ring);">
+      <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" style="margin: 0 auto;"><rect x="2" y="5" width="20" height="14" rx="2"></rect><line x1="2" y1="10" x2="22" y2="10"></line></svg>
+    </div>
+    <div class="co-title">Método de Pago</div>
+    <div class="co-sub">Selecciona cómo pagará el cliente</div>
+
+    <div class="payment-methods">
+      <button class="pay-btn" data-method="qr">
+        <svg class="pay-icon" viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><rect x="7" y="7" width="3" height="3"></rect><rect x="14" y="7" width="3" height="3"></rect><rect x="7" y="14" width="3" height="3"></rect><rect x="14" y="14" width="3" height="3"></rect></svg>
+        <span>QR</span>
+      </button>
+      <button class="pay-btn" data-method="efectivo">
+        <svg class="pay-icon" viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"></rect><circle cx="12" cy="12" r="2"></circle><path d="M6 12h.01M18 12h.01"></path></svg>
+        <span>Efectivo</span>
+      </button>
+      <button class="pay-btn" data-method="tarjeta">
+        <svg class="pay-icon" viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect><line x1="1" y1="10" x2="23" y2="10"></line></svg>
+        <span>Tarjeta</span>
+      </button>
+      <button class="pay-btn" data-method="mixto">
+        <svg class="pay-icon" viewBox="0 0 24 24" width="28" height="28" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"></path><path d="M8 3H3v5"></path><path d="M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3"></path><path d="m15 9 6-6"></path></svg>
+        <span>Mixto</span>
+      </button>
+    </div>
+
+    <div id="cash-input-area" style="display:none;">
+      <div class="cash-wrap">
+        <div class="cash-label">Monto recibido</div>
+        <input type="number" id="cash-received" class="cash-field" placeholder="0" step="1" inputmode="numeric">
+        <div id="cash-feedback" class="cash-feedback"></div>
+      </div>
+    </div>
+
+    <div id="mixto-input-area" style="display:none;">
+      <div class="mixto-wrap">
+        <div class="mixto-header">Dividir pago</div>
+        <div class="mixto-row">
+          <span class="mixto-lbl">QR</span>
+          <input type="number" id="mixto-qr" class="mixto-field mixto-input" placeholder="0" step="1" inputmode="numeric">
+        </div>
+        <div class="mixto-row">
+          <span class="mixto-lbl">Efectivo</span>
+          <input type="number" id="mixto-efectivo" class="mixto-field mixto-input" placeholder="0" step="1" inputmode="numeric">
+        </div>
+        <div class="mixto-row">
+          <span class="mixto-lbl">Tarjeta</span>
+          <input type="number" id="mixto-tarjeta" class="mixto-field mixto-input" placeholder="0" step="1" inputmode="numeric">
+        </div>
+        <div id="mixto-status" class="mixto-status"></div>
+      </div>
+    </div>
+
+    <div class="co-total" id="co-total">Bs 0</div>
+
+    <div class="co-btns">
+      <button class="co-btn cancel" id="co-cancel">Cancelar</button>
+      <button class="co-btn confirm" id="co-confirm" disabled>✓ Confirmar</button>
+    </div>
+    <div class="post-sale-print" id="post-sale-print" aria-live="polite">
+      <div class="post-sale-print-msg" id="post-sale-print-msg">Venta confirmada. Puedes imprimir la comanda.</div>
+      <button class="post-sale-print-btn" id="print-comanda-btn" type="button">IMPRIMIR COMANDA</button>
+    </div>
+  </div>
+</div>
+
+<!-- LOADING OVERLAY -->
+<div id="init-loading">
+  <div style="display:flex;flex-direction:column;align-items:center;gap:22px;">
+    <div style="position:relative;width:80px;height:80px;display:flex;align-items:center;justify-content:center;">
+      <img id="il-icon" src="https://img.icons8.com/?size=100&id=w1h9Auk9h4W9&format=png&color=FFFFFF" style="width:56px;height:56px;opacity:.9;animation:spin-slow 1.6s linear infinite;transition:opacity .4s;">
+      <svg id="il-check" viewBox="0 0 80 80" style="position:absolute;inset:0;width:80px;height:80px;opacity:0;transition:opacity .3s;">
+        <circle cx="40" cy="40" r="34" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="5"/>
+        <circle cx="40" cy="40" r="34" fill="none" stroke="#4ade80" stroke-width="5"
+          stroke-dasharray="214" stroke-dashoffset="214" stroke-linecap="round"
+          style="transform:rotate(-90deg);transform-origin:50% 50%;transition:stroke-dashoffset 0.7s ease;"/>
+        <polyline id="il-check-mark" points="24,40 36,52 56,30" fill="none" stroke="#4ade80" stroke-width="5"
+          stroke-linecap="round" stroke-linejoin="round"
+          stroke-dasharray="50" stroke-dashoffset="50"
+          style="transition:stroke-dashoffset 0.5s ease 0.6s;"/>
+      </svg>
+    </div>
+    <div style="color:#fff;font-size:20px;font-weight:900;letter-spacing:-.01em;">PlideBiz POS</div>
+    <div id="il-sub" style="color:rgba(255,255,255,.45);font-size:13px;font-weight:600;">Iniciando…</div>
+  </div>
+</div>
+
+<!-- LOGIN OVERLAY -->
+<div id="login-overlay" class="hidden">
+  <div class="login-panel">
+    <div class="login-badge-icon">
+      <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="11" width="18" height="11" rx="2.5" ry="2.5"></rect>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+        <circle cx="12" cy="16" r="1.2" fill="currentColor" stroke="none"></circle>
+      </svg>
+    </div>
+    <div class="login-logo">PlideBiz POS</div>
+    <div class="login-title">Sistema de Punto de Venta</div>
+    <div class="login-divider-row">
+      <div class="login-divider-line"></div>
+      <span class="login-divider-txt">ACCESO SEGURO</span>
+      <div class="login-divider-line"></div>
+    </div>
+    <div class="login-field-wrap">
+      <span class="login-field-icon">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+      </span>
+      <input type="text" id="login-usuario" class="login-field" placeholder="Usuario" autocomplete="new-password" name="login-usr-x9z">
+    </div>
+    <div class="login-field-wrap" style="position:relative;">
+      <span class="login-field-icon">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+      </span>
+      <input type="password" id="login-pass" class="login-field" placeholder="Contraseña" autocomplete="new-password" name="login-pwd-x9z" style="padding-right:50px!important;">
+      <button type="button" id="toggle-pass" onclick="(function(){var i=document.getElementById('login-pass');var b=document.getElementById('toggle-pass');if(i.type==='password'){i.type='text';b.innerHTML='<svg width=&quot;16&quot; height=&quot;16&quot; viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;2.2&quot; stroke-linecap=&quot;round&quot; stroke-linejoin=&quot;round&quot;><path d=&quot;M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94&quot;/><path d=&quot;M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19&quot;/><line x1=&quot;1&quot; y1=&quot;1&quot; x2=&quot;23&quot; y2=&quot;23&quot;/></svg>';}else{i.type='password';b.innerHTML='<svg width=&quot;16&quot; height=&quot;16&quot; viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;2.2&quot; stroke-linecap=&quot;round&quot; stroke-linejoin=&quot;round&quot;><path d=&quot;M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z&quot;/><circle cx=&quot;12&quot; cy=&quot;12&quot; r=&quot;3&quot;/></svg>';}})();" style="position:absolute;right:14px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:rgba(255,255,255,0.40);padding:4px;display:flex;align-items:center;justify-content:center;transition:color .15s;line-height:1;" onmouseover="this.style.color='rgba(255,255,255,0.85)'" onmouseout="this.style.color='rgba(255,255,255,0.40)'">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
+    </div>
+    <div id="login-error" class="login-error"></div>
+    <button class="login-btn" id="login-btn">
+      <span>Ingresar al Sistema</span>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+    </button>
+    <div class="login-footer">SopGlide POS · Acceso Seguro · 2026</div>
+  </div>
+</div>
+
+<!-- INVENTARIOS MODAL -->
+<div id="inventarios-modal">
+  <div class="inv-panel">
+    <div class="modal-hd">
+      <div>
+         <div class="modal-hd-title">Inventario de Cajas</div>
+        <div style="font-size:13px;color:var(--text-secondary);margin-top:3px;">Resumen de ventas por caja y método de pago</div>
+      </div>
+      <button class="modal-close" id="inv-close">✕</button>
+    </div>
+    <div class="filter-row">
+      <button class="filter-btn active" id="inv-filter-hoy" data-filter="hoy">Hoy</button>
+      <button class="filter-btn" id="inv-filter-todo" data-filter="todo">Todo</button>
+    </div>
+    <div class="summary-cards" id="inv-summary"></div>
+    <div id="inv-cajas-grid"></div>
+  </div>
+</div>
+
+<!-- REPORTES MODAL -->
+<div id="reportes-modal">
+  <div class="rep-panel" style="width:min(520px,96vw)">
+    <div class="modal-hd">
+      <div>
+        <div class="modal-hd-title">📋 Reportes</div>
+        <div style="font-size:13px;color:var(--text-secondary);margin-top:3px;">Exporta tus ventas en Excel profesional (.xlsx)</div>
+      </div>
+      <button class="modal-close" id="rep-close">✕</button>
+    </div>
+
+    <!-- Paso 1: Tipo de reporte -->
+    <div>
+      <div class="rep-step-label">1 — Tipo de reporte</div>
+      <div style="display:flex;flex-direction:column;gap:8px;" id="rep-tipo-opts">
+        <button class="rep-option-btn" data-tipo="productos">
+          <div class="rep-opt-icon"><img src="https://img.icons8.com/?size=100&id=DQwSyRV75j0z&format=png&color=FFFFFF"></div>
+          <div class="rep-opt-info">
+            <div class="rep-opt-title">Ventas por Producto</div>
+            <div class="rep-opt-sub">Cantidad y monto total de cada producto vendido</div>
+          </div>
+          <div class="rep-opt-check">✓</div>
+        </button>
+        <button class="rep-option-btn" data-tipo="cajas">
+          <div class="rep-opt-icon"><img src="https://img.icons8.com/?size=100&id=DQwSyRV75j0z&format=png&color=FFFFFF"></div>
+          <div class="rep-opt-info">
+            <div class="rep-opt-title">Total por Caja</div>
+            <div class="rep-opt-sub">Resumen de ingresos QR, efectivo y tarjeta por caja</div>
+          </div>
+          <div class="rep-opt-check">✓</div>
+        </button>
+        <button class="rep-option-btn" data-tipo="detalle">
+          <div class="rep-opt-icon"><img src="https://img.icons8.com/?size=100&id=DQwSyRV75j0z&format=png&color=FFFFFF"></div>
+          <div class="rep-opt-info">
+            <div class="rep-opt-title">Detalle de Ventas</div>
+            <div class="rep-opt-sub">Cada venta: cajero, productos, método de pago y monto</div>
+          </div>
+          <div class="rep-opt-check">✓</div>
+        </button>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+
+    <!-- Paso 2: período; el calendario se abre en un modal pequeño -->
+    <div id="rep-rango-wrap" style="opacity:.32;pointer-events:none;transition:opacity .22s;">
+      <div class="rep-step-label">2 — Período</div>
+      <button type="button" class="rep-date-trigger" id="rep-date-trigger">
+        <span class="rep-date-trigger-icon">CAL</span>
+        <span class="rep-date-trigger-copy">
+          <strong>Elegir fechas</strong>
+          <span id="rep-date-summary">Selecciona una fecha o un rango</span>
+        </span>
+        <span class="rep-date-trigger-arrow">›</span>
+      </button>
+    </div>
+
+    <!-- Botón descarga (oculto hasta elegir ambos) -->
+    <div id="rep-download-wrap" style="display:none;">
+      <button class="export-btn" id="rep-download-btn" style="margin-top:0;width:100%;font-size:15px;padding:16px 20px;display:flex;align-items:center;justify-content:center;gap:10px;">
+        <span style="font-size:18px;">⬇</span> <span id="rep-download-lbl">Descargar Reporte</span>
+      </button>
+    </div>
+
+    <div class="rep-calendar-popover" id="rep-calendar-popover" aria-hidden="true">
+      <div class="rep-date-dialog" role="dialog" aria-modal="true" aria-labelledby="rep-cal-title">
+        <div class="rep-date-dialog-head">
+          <div>
+            <div class="rep-date-dialog-kicker">PERÍODO DEL REPORTE</div>
+            <strong id="rep-cal-title">Selecciona las fechas</strong>
+          </div>
+          <button type="button" class="modal-close rep-date-dialog-close" id="rep-date-close" aria-label="Cerrar calendario">✕</button>
+        </div>
+        <div class="rep-calendar" aria-label="Calendario de fechas del reporte">
+          <div class="rep-calendar-head">
+            <button type="button" class="rep-cal-nav" id="rep-cal-prev" aria-label="Mes anterior">‹</button>
+            <strong id="rep-cal-month">—</strong>
+            <button type="button" class="rep-cal-nav" id="rep-cal-next" aria-label="Mes siguiente">›</button>
+          </div>
+          <div class="rep-cal-weekdays">
+            <span>Dom</span><span>Lun</span><span>Mar</span><span>Mié</span>
+            <span>Jue</span><span>Vie</span><span>Sáb</span>
+          </div>
+          <div class="rep-calendar-grid" id="rep-calendar-grid"></div>
+        </div>
+        <div class="rep-date-footer">
+          <span id="rep-date-dialog-summary">Selecciona una fecha o un rango</span>
+          <button type="button" class="rep-date-clear" id="rep-date-clear">Limpiar</button>
+        </div>
+        <button type="button" class="rep-date-apply" id="rep-date-apply">Aplicar fechas</button>
+      </div>
+    </div>
+
+    <!-- Botones funcionales ocultos (mantienen sus listeners) -->
+    <button id="export-productos-btn" style="display:none;"></button>
+    <button id="export-cajas-btn" style="display:none;"></button>
+  </div>
+</div>
+
+<!-- ========== CAJA MODAL ========== -->
+<div id="caja-modal">
+  <div class="caja-panel">
+
+    <!-- STEP 1: Overview de cajas -->
+    <div class="caja-step active" id="caja-step1">
+      <div class="caja-step-num">Tu turno</div>
+      <div id="overview-cajas-list" style="display:flex;flex-direction:column;gap:12px;">
+        <div style="text-align:center;color:var(--text-dim);font-size:13px;padding:10px;">Cargando…</div>
+      </div>
+      <button id="caja-btn-abrir" style="display:none;"></button>
+      <div class="caja-btns">
+        <button class="caja-btn-sec" id="caja-step1-cancel">Cancelar</button>
+      </div>
+    </div>
+
+    <!-- STEP 2: Monto de apertura -->
+    <div class="caja-step" id="caja-step2">
+
+      <!-- Tarjeta info de caja -->
+      <div style="background:rgba(10,8,28,0.85);border:1px solid rgba(255,255,255,0.16);border-radius:18px;padding:18px 22px;display:flex;align-items:center;gap:16px;">
+        <div style="width:52px;height:52px;border-radius:14px;background:linear-gradient(135deg,rgba(175,80,10,0.95),rgba(200,85,15,0.95));display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 4px 14px rgba(190,85,15,0.38);"><img src="https://img.icons8.com/?size=100&id=w1h9Auk9h4W9&format=png&color=FFFFFF" style="width:30px;height:30px;"></div>
+        <div style="flex:1;min-width:0;">
+          <div id="caja-step2-cajaname" style="font-size:18px;font-weight:900;color:#fff;letter-spacing:-.01em;">—</div>
+          <div id="caja-step2-cajero" style="font-size:13px;color:var(--text-secondary);margin-top:2px;font-weight:600;">—</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0;">
+          <div id="caja-step2-fecha" style="font-size:11px;color:var(--text-dim);font-weight:700;text-transform:capitalize;"></div>
+          <div id="caja-step2-hora" style="font-size:22px;font-weight:900;color:var(--accent-bright);margin-top:2px;letter-spacing:-.02em;"></div>
+        </div>
+      </div>
+
+      <!-- Encabezado -->
+      <div style="margin-top:2px;">
+        <div class="caja-step-num">Paso 2 de 2 — Apertura</div>
+        <div class="caja-title">Fondo inicial de caja</div>
+        <div class="caja-sub">Ingresa el efectivo disponible al iniciar el turno</div>
+      </div>
+
+      <!-- Montos rápidos -->
+      <div>
+        <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">Montos rápidos</div>
+        <div class="caja-quick-amounts">
+          <button class="caja-quick-btn" onclick="setCajaApertura(0,this)">Bs 0</button>
+          <button class="caja-quick-btn" onclick="setCajaApertura(50,this)">Bs 50</button>
+          <button class="caja-quick-btn" onclick="setCajaApertura(100,this)">Bs 100</button>
+          <button class="caja-quick-btn" onclick="setCajaApertura(200,this)">Bs 200</button>
+          <button class="caja-quick-btn" onclick="setCajaApertura(500,this)">Bs 500</button>
+          <button class="caja-quick-btn" onclick="setCajaApertura(1000,this)">Bs 1000</button>
+        </div>
+      </div>
+
+      <!-- Input monto -->
+      <div class="caja-input-wrap">
+        <div class="caja-input-label">💵 Monto de apertura (Bs)</div>
+      <input type="number" class="caja-input" id="caja-monto-apertura" placeholder="0" min="0" step="1" inputmode="numeric" oninput="document.querySelectorAll('.caja-quick-btn').forEach(b=>b.classList.remove('active'))">
+      </div>
+
+      <!-- Nota opcional -->
+      <div class="caja-input-wrap">
+        <div class="caja-input-label">📝 Observación (opcional)</div>
+        <input type="text" class="caja-input" id="caja-apertura-nota" placeholder="Ej: incluye monedas de cambio…" style="font-size:15px;padding:14px 18px;" autocomplete="off">
+      </div>
+
+      <!-- Resumen previo al confirmar -->
+      <div id="caja-step2-resumen" style="display:none;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.18);border-radius:14px;padding:14px 18px;">
+        <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Resumen de apertura</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:14px;color:rgba(255,255,255,0.70);">Fondo inicial</span>
+          <span id="caja-step2-resumen-monto" style="font-size:22px;font-weight:900;color:var(--accent-bright);">Bs 0</span>
+        </div>
+      </div>
+
+      <!-- Acciones -->
+      <div class="caja-step2-actions">
+        <button class="caja-step2-btn back" id="caja-step2-back">← Volver</button>
+        <button class="caja-step2-btn confirm" id="caja-btn-confirmar-apertura">✓ Abrir Caja</button>
+      </div>
+    </div>
+
+    <!-- CIERRE: Formulario de cierre -->
+    <div class="caja-step" id="caja-step-cierre">
+      <div class="caja-card-horiz" style="border-color:rgba(220,80,80,0.5);flex-shrink:0;">
+        <div class="caja-abrir-square" style="background:linear-gradient(135deg,rgba(160,50,50,0.95),rgba(195,70,70,0.95));box-shadow:0 6px 22px rgba(160,50,50,0.42);cursor:default;">
+          <span style="font-size:26px;line-height:1;">🔒</span>
+          <span>Cerrar<br>Caja</span>
+        </div>
+        <div class="caja-card-right">
+          <div class="caja-card-num" id="caja-cierre-num">—</div>
+          <div class="caja-card-cajera" id="caja-cierre-name">—</div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text-secondary);text-align:center;" id="caja-cierre-desde">Abierta desde —</div>
+
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <div class="caja-input-wrap">
+          <div class="caja-input-label">💵 Efectivo en caja (Bs)</div>
+          <input type="number" class="caja-input sm" id="cierre-efectivo" placeholder="0" min="0" step="1" inputmode="numeric">
+        </div>
+        <div class="caja-cierre-row">
+          <div class="caja-input-wrap">
+            <div class="caja-input-label">📱 QR (Bs)</div>
+            <input type="number" class="caja-input sm" id="cierre-qr" placeholder="0" min="0" step="1" inputmode="numeric">
+          </div>
+          <div class="caja-input-wrap">
+            <div class="caja-input-label">💳 Tarjeta (Bs)</div>
+            <input type="number" class="caja-input sm" id="cierre-tarjeta" placeholder="0" min="0" step="1" inputmode="numeric">
+          </div>
+        </div>
+      </div>
+
+      <div class="caja-result-grid" id="caja-result-grid" style="display:none;">
+        <div class="caja-result-row">
+          <span class="lbl">💵 Efectivo esperado</span><span class="val" id="cr-ef-esp">—</span>
+        </div>
+        <div class="caja-result-row">
+          <span class="lbl">💵 Efectivo contado</span><span class="val" id="cr-ef-real">—</span>
+        </div>
+        <div class="caja-result-row">
+          <span class="lbl">Diferencia efectivo</span><span class="val" id="cr-ef-dif">—</span>
+        </div>
+        <hr style="border:none;border-top:1px solid rgba(160,140,255,0.15);">
+        <div class="caja-result-row">
+          <span class="lbl">📱 QR esperado</span><span class="val" id="cr-qr-esp">—</span>
+        </div>
+        <div class="caja-result-row">
+          <span class="lbl">📱 QR contado</span><span class="val" id="cr-qr-real">—</span>
+        </div>
+        <div class="caja-result-row">
+          <span class="lbl">Diferencia QR</span><span class="val" id="cr-qr-dif">—</span>
+        </div>
+        <hr style="border:none;border-top:1px solid rgba(160,140,255,0.15);">
+        <div class="caja-result-row">
+          <span class="lbl">💳 Tarjeta esperada</span><span class="val" id="cr-tar-esp">—</span>
+        </div>
+        <div class="caja-result-row">
+          <span class="lbl">💳 Tarjeta contada</span><span class="val" id="cr-tar-real">—</span>
+        </div>
+        <div class="caja-result-row">
+          <span class="lbl">Diferencia tarjeta</span><span class="val" id="cr-tar-dif">—</span>
+        </div>
+        <div class="caja-result-row caja-result-total" id="cr-estado-final">
+          <span class="lbl">Estado</span><span class="val" id="cr-estado">—</span>
+        </div>
+      </div>
+
+      <button class="caja-btn-primary" id="caja-btn-calcular">Calcular Cierre</button>
+      <button class="caja-btn-primary red" id="caja-btn-confirmar-cierre" style="display:none;">✓ Confirmar Cierre de Caja</button>
+      <div class="caja-btns">
+        <button class="caja-btn-sec" id="caja-cierre-cancel">Cancelar</button>
+      </div>
+      <button class="monitor-open-btn" id="caja-cierre-monitor-btn" onclick="abrirMonitor()" style="display:none;">👁 Ver cajas abiertas en tiempo real</button>
+    </div>
+
+    <!-- MONITOR: Cajas abiertas -->
+    <div class="caja-step" id="caja-step-monitor">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+        <div>
+          <div class="caja-step-num">Actualiza cada 15 seg</div>
+          <div class="caja-title">Cajas Abiertas</div>
+        </div>
+        <button class="caja-btn-sec" id="monitor-refresh-btn" style="padding:6px 14px;font-size:13px;min-width:0;">↺</button>
+      </div>
+      <div class="monitor-list-wrap" id="monitor-list">
+        <div style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px;">Cargando…</div>
+      </div>
+      <div class="caja-btns" style="flex-shrink:0;">
+        <button class="caja-btn-sec" id="monitor-close-btn">Cerrar</button>
+      </div>
+    </div>
+
+    <!-- CIERRE REMOTO: Cerrar otra caja -->
+    <div class="caja-step" id="caja-step-cierre-remoto">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-shrink:0;">
+        <div>
+          <div class="caja-step-num">Cierre Remoto</div>
+          <div class="caja-title" id="cr-caja-titulo">Cerrar Caja</div>
+        </div>
+        <span class="caja-estado-tag abierta">● Abierta</span>
+      </div>
+      <div class="caja-name-tag" id="cr-caja-nombre" style="flex-shrink:0;">—</div>
+      <div style="font-size:12px;color:var(--text-secondary);text-align:center;flex-shrink:0;" id="cr-caja-desde">—</div>
+      <div style="display:flex;flex-direction:column;gap:10px;flex-shrink:0;">
+        <div class="caja-input-wrap">
+          <div class="caja-input-label">💵 Efectivo en caja (Bs)</div>
+          <input type="number" class="caja-input sm" id="cr-ef" placeholder="0" min="0" step="1" inputmode="numeric">
+        </div>
+        <div class="caja-cierre-row">
+          <div class="caja-input-wrap">
+            <div class="caja-input-label">📱 QR (Bs)</div>
+            <input type="number" class="caja-input sm" id="cr-qr2" placeholder="0" min="0" step="1" inputmode="numeric">
+          </div>
+          <div class="caja-input-wrap">
+            <div class="caja-input-label">💳 Tarjeta (Bs)</div>
+            <input type="number" class="caja-input sm" id="cr-tar2" placeholder="0" min="0" step="1" inputmode="numeric">
+          </div>
+        </div>
+      </div>
+      <div class="caja-result-grid" id="cr-result-grid" style="display:none;overflow-y:auto;max-height:180px;"></div>
+      <div style="display:flex;flex-direction:column;gap:8px;flex-shrink:0;">
+        <button class="caja-btn-primary" id="cr-btn-calcular">Calcular Cierre</button>
+        <button class="caja-btn-primary red" id="cr-btn-confirmar" style="display:none;">✓ Confirmar Cierre</button>
+        <div class="caja-btns">
+          <button class="caja-btn-sec" id="cr-btn-volver">← Monitor</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ORDENES MODAL -->
+<div id="ordenes-modal">
+  <div class="ord-panel">
+    <div class="modal-hd" style="margin-bottom:20px;">
+      <div>
+        <div class="ord-header-copy">
+          <div class="ord-header-eyebrow">GESTIÓN DE VENTAS</div>
+          <div class="modal-hd-title ord-header-title">Órdenes</div>
+          <div class="ord-header-subtitle">
+            Consulta, reimpresión y control de comandas
+          </div>
+        </div>
+      </div>
+      <button class="modal-close" id="ord-close" style="width:40px;height:40px;font-size:18px;">✕</button>
+    </div>
+
+    <!-- Filtros + búsqueda -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:18px;">
+      <button class="filter-btn active" id="ord-filter-mia" data-filter="mia">Mi caja</button>
+      <button class="filter-btn" id="ord-filter-todas" data-filter="todas">Todas las cajas</button>
+      <div class="ord-search-wrap">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4"/>
+        </svg>
+        <input type="text" id="ord-search" class="ord-search" placeholder="Buscar por N.º de comanda, producto o cajero">
+      </div>
+    </div>
+
+    <!-- Contador -->
+    <div id="ord-count-label" style="font-size:11px;color:var(--text-dim);margin-bottom:12px;font-weight:600;letter-spacing:.04em;"></div>
+
+    <!-- Lista de órdenes -->
+    <div class="ord-list" id="ord-list">
+      <div class="ord-empty">Cargando órdenes…</div>
+    </div>
+  </div>
+</div>
+
+<div id="confirm-toast">
+  <div class="ct-inner">
+    <div class="ct-icon" id="ct-icon">⚠️</div>
+    <div class="ct-msg" id="ct-msg">¿Estás seguro?</div>
+    <div class="ct-btns">
+      <button class="ct-btn cancel" id="ct-cancel">Cancelar</button>
+      <button class="ct-btn danger" id="ct-confirm">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="./script.js"></script>
 </body>
 </html>
