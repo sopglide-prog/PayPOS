@@ -543,8 +543,8 @@ document.getElementById('caja-btn-confirmar-cierre').addEventListener('click', a
   // El cierre conserva su formato actual; el transporte físico se realiza
   // mediante WebUSB + ESC/POS, igual que las comandas.
   const fmtDif = d => d > 0
-    ? `SOBRA Bs ${Math.abs(d).toFixed(2)}`
-    : `FALTA Bs ${Math.abs(d).toFixed(2)}`;
+    ? `SOBRA Bs ${fmt(Math.abs(d))}`
+    : `FALTA Bs ${fmt(Math.abs(d))}`;
   const difLine = d => Math.abs(d) < 0.01
     ? ''
     : `<div class="pc-dif"><span>DIFERENCIA</span><span>${fmtDif(d)}</span></div>`;
@@ -663,16 +663,35 @@ document.getElementById('caja-btn-confirmar-cierre').addEventListener('click', a
   const totEsp = (parseFloat(btn.dataset.efEsp)||0) + vQr2 + vTar2;
   const totCont = efReal + qrReal + tarReal;
   pa.innerHTML = `
-    <div class="pc-brand">MAMA ORURO</div>
+    <div class="pc-brand">MAMA POTOSI</div>
     <div class="pc-titulo">CIERRE DE CAJA</div>
     <div class="pc-ticket-meta">
       <span>CAJA: ${formatReceiptCaja(s2?.caja || turno?.caja)}</span>
       <span class="pc-datetime">${formatReceiptDateTime(ahora)}</span>
     </div>
     <hr class="pc-divider">
-     <div class="pc-metodo">EFECTIVO</div>
-     <div class="pc-row"><span class="pc-lbl">ESPERADO</span><span class="pc-val">Bs ${fmt(parseFloat(btn.dataset.efEsp)||0)}</span></div>
-     <div class="pc-row"><span class="pc-lbl">CONTADO</span><span class="pc-val">Bs ${fmt(efReal)}</span></div>
+    <div class="pc-metodo">EFECTIVO</div>
+
+    <div class="pc-row">
+      <span class="pc-lbl">VENTAS</span>
+      <span class="pc-val">Bs ${fmt(vEf2)}</span>
+    </div>
+
+    <div class="pc-row">
+      <span class="pc-lbl">FONDO INICIAL</span>
+      <span class="pc-val">Bs ${fmt(apertura2)}</span>
+    </div>
+
+    <div class="pc-row">
+      <span class="pc-lbl">ESPERADO</span>
+      <span class="pc-val">Bs ${fmt(parseFloat(btn.dataset.efEsp)||0)}</span>
+    </div>
+
+    <div class="pc-row">
+      <span class="pc-lbl">CONTADO</span>
+      <span class="pc-val">Bs ${fmt(efReal)}</span>
+    </div>
+
     ${difLine(difEf2)}
     <hr class="pc-section-divider">
      <div class="pc-metodo">QR</div>
@@ -794,7 +813,104 @@ async function loadProductsFromSupabase() {
   } catch (err) { console.error("Failed to load products:", err); }
 }
 loadProductsFromSupabase();
+// ── ACTUALIZACIÓN AUTOMÁTICA DEL CATÁLOGO ─────────────────
 
+// Cuando la tablet/app vuelve a estar visible,
+// volver a consultar los productos actuales.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    loadProductsFromSupabase();
+  }
+});
+
+// Mientras la app esté abierta,
+// actualizar catálogo cada 2 minutos.
+setInterval(() => {
+  if (document.visibilityState === 'visible') {
+    loadProductsFromSupabase();
+  }
+}, 120000);
+async function validarCarritoContraSupabase() {
+  if (!supabaseClient) {
+    throw new Error('No hay conexión con Supabase');
+  }
+
+  if (!cart.length) {
+    throw new Error('El carrito está vacío');
+  }
+
+  const ids = [...new Set(
+    cart
+      .map(item => Number(item.id))
+      .filter(Number.isFinite)
+  )];
+
+  if (ids.length !== cart.length) {
+    throw new Error('Hay un producto del carrito sin ID válido');
+  }
+
+  const { data, error } = await supabaseClient
+    .from('MAMAPOTOSI')
+    .select('id,nombre,precio,imagen')
+    .in('id', ids);
+
+  if (error) {
+    throw new Error('No se pudo verificar el catálogo: ' + error.message);
+  }
+
+  const productosActuales = new Map(
+    (data || []).map(p => [Number(p.id), p])
+  );
+
+  // Ningún producto del carrito puede haber desaparecido del catálogo.
+  for (const item of cart) {
+    const actual = productosActuales.get(Number(item.id));
+
+    if (!actual) {
+      throw new Error(
+        `El producto "${item.name}" ya no existe en el catálogo. Elimínalo del carrito y vuelve a intentarlo.`
+      );
+    }
+  }
+
+  let huboCambios = false;
+
+  cart = cart.map(item => {
+    const actual = productosActuales.get(Number(item.id));
+
+    const nombreActual = String(actual.nombre || '').trim();
+    const precioActual = Number(actual.precio) || 0;
+    const nombreAnterior = String(item.name || '').trim();
+    const precioAnterior = Number(item.price) || 0;
+
+    if (
+      nombreActual !== nombreAnterior ||
+      precioActual !== precioAnterior
+    ) {
+      huboCambios = true;
+    }
+
+    return {
+      ...item,
+
+      // SIEMPRE usamos los datos actuales de Supabase
+      id: Number(actual.id),
+      name: nombreActual,
+      price: precioActual,
+      image: actual.imagen || item.image || '',
+      qty: item.qty
+    };
+  });
+
+  if (huboCambios) {
+    renderCart();
+    await loadProductsFromSupabase();
+  }
+
+  return {
+    huboCambios
+  };
+}
 function renderProducts() {
   const q = searchQ.toLowerCase().trim();
   const words = q ? q.split(/\s+/).filter(Boolean) : [];
@@ -926,6 +1042,86 @@ let discountValue = 0;
 let selectedPaymentMethod = null;
 let pendingVentaTimestamp = null;
 let pendingSavedVenta = null;
+const checkoutModal = document.getElementById('checkout-modal');
+let checkoutViewportRaf = 0;
+
+function syncCheckoutViewport() {
+  if (!checkoutModal) return;
+
+  const viewport = window.visualViewport;
+  const height = Math.max(1, Math.round(viewport?.height || window.innerHeight));
+  // iOS puede cambiar offsetTop al pasar entre inputs. No lo usamos para
+  // mover el modal: el checkout debe permanecer fijo arriba de la pantalla.
+  const top = 0;
+  const keyboardOpen = Boolean(
+    viewport &&
+    (window.innerHeight - viewport.height > 120 ||
+      viewport.height < window.innerHeight * 0.78)
+  );
+
+  checkoutModal.style.setProperty('--checkout-viewport-height', `${height}px`);
+  checkoutModal.style.setProperty('--checkout-viewport-top', `${top}px`);
+  checkoutModal.classList.toggle('keyboard-open', keyboardOpen);
+
+  const focusedField = document.activeElement;
+  if (
+    checkoutModal.classList.contains('open') &&
+    keyboardOpen &&
+    focusedField &&
+    checkoutModal.contains(focusedField) &&
+    focusedField.matches('input, textarea, select')
+  ) {
+    requestAnimationFrame(() => {
+      const panel = checkoutModal.querySelector('.co-panel');
+      if (!panel) return;
+
+      const panelRect = panel.getBoundingClientRect();
+      const fieldRect = focusedField.getBoundingClientRect();
+      const visibleTop = Math.max(panelRect.top, top + 12);
+      const visibleBottom = Math.min(panelRect.bottom, top + height - 12);
+
+      // Desplazar solo el contenido del panel evita que Safari panee toda la
+      // página y haga parecer que el modal bajó al cambiar de campo.
+      if (fieldRect.bottom > visibleBottom) {
+        panel.scrollTop += fieldRect.bottom - visibleBottom;
+      } else if (fieldRect.top < visibleTop) {
+        panel.scrollTop -= visibleTop - fieldRect.top;
+      }
+    });
+  }
+}
+
+function queueCheckoutViewportSync() {
+  if (checkoutViewportRaf) cancelAnimationFrame(checkoutViewportRaf);
+  checkoutViewportRaf = requestAnimationFrame(() => {
+    checkoutViewportRaf = 0;
+    syncCheckoutViewport();
+  });
+}
+
+function openCheckoutModal() {
+  checkoutModal.classList.add('open');
+  syncCheckoutViewport();
+  queueCheckoutViewportSync();
+}
+
+function closeCheckoutModal() {
+  const focusedField = document.activeElement;
+  if (focusedField && checkoutModal.contains(focusedField) && typeof focusedField.blur === 'function') {
+    focusedField.blur();
+  }
+  checkoutModal.classList.remove('open', 'keyboard-open');
+  checkoutModal.style.removeProperty('--checkout-viewport-height');
+  checkoutModal.style.removeProperty('--checkout-viewport-top');
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', queueCheckoutViewportSync);
+  window.visualViewport.addEventListener('scroll', queueCheckoutViewportSync);
+}
+window.addEventListener('resize', queueCheckoutViewportSync);
+checkoutModal.addEventListener('focusin', queueCheckoutViewportSync);
+checkoutModal.addEventListener('focusout', () => setTimeout(queueCheckoutViewportSync, 50));
 
 function getSaleTotals() {
   const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
@@ -1017,7 +1213,7 @@ document.getElementById('btn-checkout').addEventListener('click', () => {
   document.getElementById('cash-feedback').className = 'cash-feedback';
   document.getElementById('mixto-status').textContent = '';
   document.getElementById('mixto-status').className = 'mixto-status';
-  document.getElementById('checkout-modal').classList.add('open');
+  openCheckoutModal();
 });
 
 document.querySelectorAll('.pay-btn').forEach(btn => {
@@ -1070,7 +1266,7 @@ document.getElementById('cash-received').addEventListener('input', (e) => {
 document.getElementById('co-cancel').addEventListener('click', () => {
   pendingVentaTimestamp = null;
   pendingSavedVenta = null;
-  document.getElementById('checkout-modal').classList.remove('open');
+  closeCheckoutModal();
 });
 
 function fmt(n) {
@@ -1741,12 +1937,49 @@ async function imprimirTicketCuandoEsteListo() {
     btn.disabled = true;
     btn.textContent = 'PROCESANDO…';
 
+    // ── VALIDAR PRODUCTOS CONTRA SUPABASE ─────────────────────
+    try {
+      const { huboCambios } = await validarCarritoContraSupabase();
+
+      if (huboCambios) {
+        const { total: totalActualizado } = getSaleTotals();
+
+        document.getElementById('co-total').textContent =
+          `Bs ${fmt(totalActualizado)}`;
+
+        btn.disabled = false;
+        btn.textContent = '✓ Confirmar';
+
+        showToast(
+          '⚠️ El catálogo cambió. Se actualizaron los productos. Revisa y confirma nuevamente.',
+          4500,
+          'warning'
+        );
+
+        return;
+      }
+
+    } catch (error) {
+      console.error('Error validando productos:', error);
+
+      btn.disabled = false;
+      btn.textContent = '✓ Confirmar';
+
+      showToast(
+        `⚠️ ${error.message || 'No se pudieron verificar los productos'}`,
+        5000,
+        'warning'
+      );
+
+      return;
+    }
+
+    // ── CALCULAR VENTA DESPUÉS DE VALIDAR ─────────────────────
     const {
       subtotal,
       descuentoMonto,
       total
     } = getSaleTotals();
-
     if (!selectedPaymentMethod) {
       showToast('⚠️ Selecciona un método de pago', 3000);
       btn.disabled = false;
@@ -1803,6 +2036,65 @@ async function imprimirTicketCuandoEsteListo() {
      * Mantener la misma marca de tiempo si el primer intento queda
      * incierto por red. Esto permite reconciliarlo sin crear otra venta.
      */
+    // ── VALIDAR QUE EL TURNO SIGA ABIERTO EN SUPABASE ─────────
+    const turnoActual = getTurno();
+
+    if (!turnoActual?.id) {
+      btn.disabled = false;
+      btn.textContent = '✓ Confirmar';
+
+      showToast(
+        '🔒 No hay un turno de caja abierto',
+        4000,
+        'warning'
+      );
+
+      return;
+    }
+
+    try {
+      const { data: turnoRemoto, error: turnoError } = await supabaseClient
+        .from('turnos_caja')
+        .select('id,estado,cajero,caja')
+        .eq('id', turnoActual.id)
+        .maybeSingle();
+
+      if (turnoError) {
+        throw turnoError;
+      }
+
+      if (!turnoRemoto || turnoRemoto.estado !== 'abierta') {
+        clearTurno();
+        updateDockCajaLabel();
+
+        btn.disabled = false;
+        btn.textContent = '✓ Confirmar';
+
+        closeCheckoutModal();
+
+        showToast(
+          '🔒 Esta caja ya fue cerrada. No se puede registrar la venta.',
+          5000,
+          'warning'
+        );
+
+        return;
+      }
+
+    } catch (error) {
+      console.error('Error verificando turno:', error);
+
+      btn.disabled = false;
+      btn.textContent = '✓ Confirmar';
+
+      showToast(
+        '⚠️ No se pudo verificar el estado de la caja. La venta no fue guardada.',
+        5000,
+        'warning'
+      );
+
+      return;
+    }
     const now = new Date(pendingVentaTimestamp || new Date().toISOString());
     pendingVentaTimestamp = now.toISOString();
 
@@ -1814,6 +2106,7 @@ async function imprimirTicketCuandoEsteListo() {
       turno_id: getTurno()?.id || null,
 
       productos: cart.map(i => ({
+        id: i.id,
         nombre: i.name,
         qty: i.qty,
         precio: i.price
@@ -1922,182 +2215,23 @@ async function imprimirTicketCuandoEsteListo() {
       creado_en: ventaObj.creado_en
     };
 
-    // ── IMPRESIÓN AUTOMÁTICA ────────────────────────────────
-    try {
+    // ── VENTA GUARDADA; IMPRESIÓN MANUAL ─────────────────────
+    // La impresora nunca participa en la confirmación de la venta. Primero
+    // se confirma Supabase y después el cajero decide si imprime la comanda.
+    const printPanel = document.getElementById('post-sale-print');
+    const printMessage = document.getElementById('post-sale-print-msg');
+    const printBtn = document.getElementById('print-comanda-btn');
+    printMessage.textContent = 'Venta guardada. Puedes imprimir la comanda.';
+    printBtn.disabled = false;
+    printBtn.textContent = 'IMPRIMIR COMANDA';
+    printPanel.classList.add('show');
 
-      await imprimirComandaUsb(
-        pendingComandaData
-      );
-
-      // ── IMPRESIÓN CORRECTA ────────────────────────────────
-      showToast(
-        '✅ Comanda impresa automáticamente',
-        2500
-      );
-
-      // Eliminar posibles elementos antiguos de impresión
-      const legacyPrintArea =
-        document.getElementById('print-area');
-
-      if (legacyPrintArea) {
-        legacyPrintArea.remove();
-      }
-
-      const legacyPrintStyle =
-        document.getElementById('print-style-tag');
-
-      if (legacyPrintStyle) {
-        legacyPrintStyle.remove();
-      }
-
-      // Vaciar carrito
-      clearCart();
-      // Limpiar nota del pedido
-      const orderNote = document.getElementById('order-note');
-
-      if (orderNote) {
-        orderNote.value = '';
-      }
-      // Limpiar descuento del pedido
-      discountType = 'bs';
-      discountValue = 0;
-
-      const discountInput =
-        document.getElementById('order-discount-value');
-
-      if (discountInput) {
-        discountInput.value = '';
-      }
-
-      document.querySelectorAll('.discount-type')
-        .forEach(btn => {
-          btn.classList.toggle(
-            'active',
-            btn.dataset.discountType === 'bs'
-          );
-        });
-
-      const discountResult =
-        document.getElementById('order-discount-result');
-
-      if (discountResult) {
-        discountResult.textContent = '';
-      }
-      // Ocultar panel de impresión
-      const printPanel =
-        document.getElementById('post-sale-print');
-
-      const printMessage =
-        document.getElementById('post-sale-print-msg');
-
-      printPanel.classList.remove('show');
-      printMessage.textContent = '';
-
-      // ── CERRAR MODAL DE MÉTODO DE PAGO ─────────────────────
-      document
-        .getElementById('checkout-modal')
-        .classList.remove('open');
-
-      // ── PREPARAR SISTEMA PARA LA SIGUIENTE VENTA ──────────
-      selectedPaymentMethod = null;
-      pendingComandaData = null;
-      pendingVentaTimestamp = null;
-      pendingSavedVenta = null;
-
-      // Restaurar botón Confirmar
-      btn.textContent = '✓ Confirmar';
-      btn.disabled = true;
-
-      // Habilitar métodos de pago nuevamente
-      document
-        .querySelectorAll('.pay-btn')
-        .forEach(paymentBtn => {
-
-          paymentBtn.disabled = false;
-          paymentBtn.classList.remove('selected');
-
-        });
-
-      // Limpiar efectivo
-      const cashReceived =
-        document.getElementById('cash-received');
-
-      if (cashReceived) {
-        cashReceived.value = '';
-      }
-
-      const cashFeedback =
-        document.getElementById('cash-feedback');
-
-      if (cashFeedback) {
-        cashFeedback.textContent = '';
-        cashFeedback.className = 'cash-feedback';
-      }
-
-      // Limpiar pago mixto
-      document
-        .querySelectorAll('.mixto-input')
-        .forEach(input => {
-          input.value = '';
-        });
-
-      const mixtoStatus =
-        document.getElementById('mixto-status');
-
-      if (mixtoStatus) {
-        mixtoStatus.textContent = '';
-        mixtoStatus.className = 'mixto-status';
-      }
-
-      // Ocultar áreas de pago
-      const cashArea =
-        document.getElementById('cash-input-area');
-
-      if (cashArea) {
-        cashArea.style.display = 'none';
-      }
-
-      const mixtoArea =
-        document.getElementById('mixto-input-area');
-
-      if (mixtoArea) {
-        mixtoArea.style.display = 'none';
-      }
-
-      // Actualizar carrito/pantalla
-      renderCart();
-
-    } catch (error) {
-
-      // ── IMPRESIÓN FALLIDA ─────────────────────────────────
-      console.error(
-        'Error de impresión automática:',
-        error
-      );
-
-      showToast(
-        '⚠️ La venta se guardó, pero la impresión falló',
-        4500
-      );
-
-      // NO cerramos el modal.
-      // NO borramos la comanda.
-      // NO dejamos bloqueado el sistema.
-
-      document
-        .getElementById('post-sale-print-msg')
-        .textContent =
-          'Venta guardada, pero la impresión falló. Puedes reintentar.';
-
-      document
-        .getElementById('post-sale-print')
-        .classList.add('show');
-
-      // La venta ya está guardada: solo se debe reintentar la impresión.
-      // Mantener Confirmar deshabilitado evita una venta duplicada.
-      btn.disabled = true;
-      btn.textContent = 'VENTA GUARDADA';
-    }
+    // Evita guardar una segunda venta mientras esta comanda siga pendiente.
+    btn.disabled = true;
+    btn.textContent = 'VENTA GUARDADA';
+    document.querySelectorAll('.pay-btn').forEach(paymentBtn => {
+      paymentBtn.disabled = true;
+    });
   });
 
 
@@ -2113,7 +2247,7 @@ document.getElementById('print-comanda-btn').addEventListener('click', async (e)
     document.getElementById('post-sale-print-msg').textContent =
       'Comanda enviada correctamente a la Epson';
     showToast('✅ Comanda impresa', 2500);
-    document.getElementById('checkout-modal').classList.remove('open');
+     closeCheckoutModal();
     document.getElementById('post-sale-print').classList.remove('show');
     document.getElementById('co-confirm').textContent = '✓ Confirmar';
     document.getElementById('co-confirm').disabled = true;
@@ -2137,7 +2271,7 @@ document.getElementById('print-comanda-btn').addEventListener('click', async (e)
 
 document.getElementById('checkout-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('checkout-modal'))
-    document.getElementById('checkout-modal').classList.remove('open');
+    closeCheckoutModal();
 });
 
 const searchEl = document.getElementById('search');
@@ -2553,25 +2687,25 @@ async function loadInventarios(filtro) {
     });
 
     summary.innerHTML = `
-      <div class="sum-card">
+       <div class="sum-card sum-card-qr">
          <div class="sum-card-icon">QR</div>
         <div class="sum-card-label">QR</div>
-        <div class="sum-card-value">Bs ${totalQr.toFixed(2)}</div>
+         <div class="sum-card-value">${fmt(totalQr)} Bs</div>
       </div>
-      <div class="sum-card">
+       <div class="sum-card sum-card-ef">
          <div class="sum-card-icon">EF</div>
         <div class="sum-card-label">Efectivo</div>
-        <div class="sum-card-value">Bs ${totalEf.toFixed(2)}</div>
+         <div class="sum-card-value">${fmt(totalEf)} Bs</div>
       </div>
-      <div class="sum-card">
+       <div class="sum-card sum-card-tar">
          <div class="sum-card-icon">TC</div>
         <div class="sum-card-label">Tarjeta</div>
-        <div class="sum-card-value">Bs ${totalTar.toFixed(2)}</div>
+         <div class="sum-card-value">${fmt(totalTar)} Bs</div>
       </div>
-      <div class="sum-card">
+       <div class="sum-card sum-card-total">
          <div class="sum-card-icon">TOTAL</div>
         <div class="sum-card-label">Total General</div>
-        <div class="sum-card-value">Bs ${totalGen.toFixed(2)}</div>
+         <div class="sum-card-value">${fmt(totalGen)} Bs</div>
       </div>`;
 
     const porCaja = {};
@@ -2598,28 +2732,28 @@ async function loadInventarios(filtro) {
       <div class="inv-caja-card">
         <div class="inv-caja-header">
           <div>
-            <div class="inv-caja-name"><span class="inv-caja-badge">C${num}</span><span>Caja ${num}</span></div>
+            <div class="inv-caja-name"><span class="inv-caja-badge" aria-label="Caja ${num}">C${num}</span></div>
             <div class="inv-caja-cajero">${d.cajero}</div>
           </div>
           <div class="inv-caja-cnt">${d.cnt} venta${d.cnt!==1?'s':''}</div>
         </div>
         <div class="inv-caja-methods">
-          <div class="inv-method-item">
+          <div class="inv-method-item inv-method-qr">
             <div class="inv-method-label">QR</div>
-            <div class="inv-method-val">Bs ${d.qr.toFixed(2)}</div>
+            <div class="inv-method-val">${fmt(d.qr)} Bs</div>
           </div>
-          <div class="inv-method-item">
+          <div class="inv-method-item inv-method-ef">
             <div class="inv-method-label">Efectivo</div>
-            <div class="inv-method-val">Bs ${d.ef.toFixed(2)}</div>
+            <div class="inv-method-val">${fmt(d.ef)} Bs</div>
           </div>
-          <div class="inv-method-item">
+          <div class="inv-method-item inv-method-tar">
             <div class="inv-method-label">Tarjeta</div>
-            <div class="inv-method-val">Bs ${d.tar.toFixed(2)}</div>
+            <div class="inv-method-val">${fmt(d.tar)} Bs</div>
           </div>
         </div>
         <div class="inv-caja-total">
           <span class="inv-caja-total-lbl">Total Caja</span>
-          <span class="inv-caja-total-val">Bs ${d.total.toFixed(2)}</span>
+          <span class="inv-caja-total-val">${fmt(d.total)} Bs</span>
         </div>
       </div>`;
     }).join('');
@@ -2655,6 +2789,9 @@ let repRango = 'personalizado';
 let repFechaInicio = null;
 let repFechaFin = null;
 let repFechasAplicadas = false;
+
+let repCajaSeleccionada = 'todas';
+
 let repCalendarioMes = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 
 function repFechaKey(date) {
@@ -2797,33 +2934,142 @@ document.getElementById('rep-date-clear').addEventListener('click', () => {
   repUpdateDownloadBtn();
 });
 
+function repOpenCajaModal() {
+  const modal = document.getElementById('rep-caja-modal');
+
+  if (!modal) return;
+
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+
+function repCloseCajaModal() {
+  const modal = document.getElementById('rep-caja-modal');
+
+  if (!modal) return;
+
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+
 document.getElementById('rep-date-apply').addEventListener('click', () => {
+
   if (!repFechaInicio) {
-    showToast('Selecciona una fecha para descargar el reporte', 2500);
+    showToast('Selecciona una fecha', 2500);
     return;
   }
-  repFechasAplicadas = true;
-  repCloseDatePicker();
-  repUpdateDateSummary();
-  repUpdateDownloadBtn();
-});
 
+  // Confirmar fecha seleccionada
+  repFechasAplicadas = true;
+
+  // Cerrar calendario
+  repCloseDatePicker();
+
+  // Actualizar fecha internamente
+  repUpdateDateSummary();
+
+  // Abrir selección de caja
+  repOpenCajaModal();
+});
+document
+.getElementById('rep-caja-close')
+?.addEventListener('click', repCloseCajaModal);
+document
+.getElementById('rep-caja-modal')
+?.addEventListener('click', e => {
+
+  if (e.target.id === 'rep-caja-modal') {
+    repCloseCajaModal();
+  }
+
+});
 document.getElementById('rep-date-trigger').addEventListener('click', repOpenDatePicker);
 document.getElementById('rep-date-close').addEventListener('click', repCloseDatePicker);
 document.getElementById('rep-calendar-popover').addEventListener('click', e => {
   if (e.target.id === 'rep-calendar-popover') repCloseDatePicker();
 });
+document.querySelectorAll('.rep-caja-option').forEach(btn => {
+
+  btn.addEventListener('click', () => {
+
+    // Guardar caja seleccionada
+    repCajaSeleccionada = btn.dataset.caja;
+
+    // Mantener sincronizado el select oculto
+    const cajaSelect =
+      document.getElementById('rep-caja-select');
+
+    if (cajaSelect) {
+      cajaSelect.value = repCajaSeleccionada;
+    }
+
+    // Cerrar mini modal de caja
+    repCloseCajaModal();
+
+    // Descargar automáticamente usando
+    // la lógica de descarga que ya existe
+    document
+      .getElementById('rep-download-btn')
+      ?.click();
+
+    // Cerrar modal principal de reportes
+    document
+      .getElementById('reportes-modal')
+      ?.classList.remove('open');
+
+  });
+
+});
+function repNormalizarCaja(caja) {
+  return String(caja || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[^0-9]/g, '');
+}
 
 function repGetFiltradas() {
   if (!repFechaInicio || !repFechasAplicadas) return [];
-  const fin = repFechaFin || repFechaInicio;
+
+  const [year, month, day] = repFechaInicio.split('-').map(Number);
+
+  const inicioEvento = new Date(
+    year,
+    month - 1,
+    day,
+    20, 0, 0, 0
+  );
+
+  const finEvento = new Date(
+    year,
+    month - 1,
+    day + 1,
+    6, 0, 0, 0
+  );
+
   return repVentas.filter(v => {
     if (!v.creado_en) return false;
-    const key = repFechaKey(new Date(v.creado_en));
-    return key >= repFechaInicio && key <= fin;
+
+    const fechaVenta = new Date(v.creado_en);
+
+    const perteneceEvento =
+      fechaVenta >= inicioEvento &&
+      fechaVenta < finEvento;
+
+    if (!perteneceEvento) return false;
+
+    if (repCajaSeleccionada === 'todas') {
+      return true;
+    }
+
+    const cajaVenta = repNormalizarCaja(v.caja);
+    const cajaFiltro = repNormalizarCaja(repCajaSeleccionada);
+
+    return cajaVenta === cajaFiltro;
   });
 }
-
 function repUpdateDownloadBtn() {
   const wrap = document.getElementById('rep-download-wrap');
   const lbl  = document.getElementById('rep-download-lbl');
@@ -2839,7 +3085,28 @@ function repUpdateDownloadBtn() {
 
 function repResetUI() {
   repTipo = null;
-  document.querySelectorAll('.rep-option-btn').forEach(b => b.classList.remove('active'));
+  repCajaSeleccionada = 'todas';
+  document
+    .querySelectorAll('.rep-main-option')
+    .forEach(btn => btn.classList.remove('active'));
+
+  document
+    .querySelectorAll('.rep-caja-option')
+    .forEach(btn => btn.classList.remove('active'));
+
+  repCloseDatePicker();
+
+  if (typeof repCloseCajaModal === 'function') {
+    repCloseCajaModal();
+  }
+  const cajaSelect = document.getElementById('rep-caja-select');
+
+  if (cajaSelect) {
+    cajaSelect.value = 'todas';
+  }
+  document
+  .querySelectorAll('.rep-main-option')
+  .forEach(b => b.classList.remove('active'));
   repRango = 'personalizado';
   repFechaInicio = null;
   repFechaFin = null;
@@ -2854,15 +3121,39 @@ function repResetUI() {
   repUpdateDownloadBtn();
 }
 
-document.querySelectorAll('.rep-option-btn').forEach(btn => {
+document.querySelectorAll('.rep-main-option').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.rep-option-btn').forEach(b => b.classList.remove('active'));
+
+    // Limpiar selección visual anterior
+    document
+      .querySelectorAll('.rep-main-option')
+      .forEach(b => b.classList.remove('active'));
+
+    // Marcar reporte seleccionado
     btn.classList.add('active');
+
+    // Guardar tipo de reporte
     repTipo = btn.dataset.tipo;
-    const rangoWrap = document.getElementById('rep-rango-wrap');
-    if (rangoWrap) { rangoWrap.style.opacity = '1'; rangoWrap.style.pointerEvents = 'auto'; }
+
+    // Reiniciar fecha anterior
+    repFechaInicio = null;
+    repFechaFin = null;
+    repFechasAplicadas = false;
+    repRango = 'personalizado';
+
+    // Mostrar el mes actual
+    const ahora = new Date();
+
+    repCalendarioMes = new Date(
+      ahora.getFullYear(),
+      ahora.getMonth(),
+      1
+    );
+
+    // Actualizar y abrir calendario
+    repRenderCalendario();
+    repUpdateDateSummary();
     repOpenDatePicker();
-    repUpdateDownloadBtn();
   });
 });
 
@@ -2891,9 +3182,32 @@ async function crearExcelProfesional({ titulo, subtitulo, columnas, filas, filaT
   const ws = wb.addWorksheet(subtitulo, {
     pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true }
   });
-  const now   = new Date();
-  const fecha = now.toLocaleDateString('es-BO', { day: '2-digit', month: 'long', year: 'numeric' });
-  const hora  = now.toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const now = new Date();
+
+  // Fecha del evento seleccionada en Reportes
+  let fechaReporte = repFechaInicio || new Date().toISOString().slice(0, 10);
+
+  const [yearReporte, monthReporte, dayReporte] = fechaReporte
+    .split('-')
+    .map(Number);
+
+  const fechaEvento = new Date(
+    yearReporte,
+    monthReporte - 1,
+    dayReporte
+  );
+
+  const fecha = fechaEvento.toLocaleDateString('es-BO', {
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric'
+  });
+
+  const hora = now.toLocaleTimeString('es-BO', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
   const nc    = columnas.length;
 
   const estiloFila = (row, { bg, fg = 'FFFFFFFF', bold = false, size = 12, alto = 28, hAlign = 'center' }) => {
@@ -2955,7 +3269,7 @@ async function crearExcelProfesional({ titulo, subtitulo, columnas, filas, filaT
         right:  { style: 'thin', color: { argb: 'FFBBDDC8' } },
       };
       if (col.formato === 'moneda') {
-        cell.numFmt = '"Bs "#,##0.00';
+        cell.numFmt = '"Bs "#,##0';
         cell.font   = { name: 'Calibri', size: 11, color: { argb: 'FF0D5C2E' }, bold: true };
       }
       if (col.formato === 'numero') {
@@ -2980,7 +3294,7 @@ async function crearExcelProfesional({ titulo, subtitulo, columnas, filas, filaT
         bottom: { style: 'medium', color: { argb: 'FF095028' } },
         right:  { style: 'medium', color: { argb: 'FF095028' } },
       };
-      if (col.formato === 'moneda') cell.numFmt = '"Bs "#,##0.00';
+      if (col.formato === 'moneda') cell.numFmt = '"Bs "#,##0';
       if (col.formato === 'numero') cell.numFmt = '#,##0';
     });
   }
@@ -2990,95 +3304,306 @@ async function crearExcelProfesional({ titulo, subtitulo, columnas, filas, filaT
   const blob     = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   const url      = URL.createObjectURL(blob);
   const a        = document.createElement('a');
-  const ts       = new Date().toISOString().slice(0, 10);
-  a.href         = url;
-  a.download     = `${nombreArchivo}_${ts}.xlsx`;
+  const ts = repFechaInicio || new Date().toISOString().slice(0, 10);
+
+  a.href = url;
+  a.download = `${nombreArchivo}_${ts}.xlsx`;
   a.click();
   URL.revokeObjectURL(url);
 }
 
-/* ========== EXPORT: DETALLE DE VENTAS ========== */
 async function exportDetalleVentas(data) {
   const rows = data || repVentas;
-  if (!rows.length) { showToast('Sin ventas para exportar', 2000); return; }
+
+  if (!rows.length) {
+    showToast('Sin ventas para exportar', 2000);
+    return;
+  }
 
   const columnas = [
-    { label: 'Fecha',        ancho: 14, align: 'center' },
-    { label: 'Hora',         ancho: 10, align: 'center' },
-    { label: 'N° Orden',     ancho: 12, align: 'center' },
-    { label: 'Caja',         ancho: 14, align: 'left'   },
-    { label: 'Cajero',       ancho: 18, align: 'left'   },
-    { label: 'Productos',    ancho: 40, align: 'left'   },
-    { label: 'QR Bs',        ancho: 12, align: 'right',  formato: 'moneda' },
-    { label: 'Efectivo Bs',  ancho: 14, align: 'right',  formato: 'moneda' },
-    { label: 'Tarjeta Bs',   ancho: 14, align: 'right',  formato: 'moneda' },
-    { label: 'Total Bs',     ancho: 14, align: 'right',  formato: 'moneda' },
+    { label: 'Fecha',              ancho: 14, align: 'center' },
+    { label: 'Hora',               ancho: 10, align: 'center' },
+    { label: 'N° Orden',           ancho: 12, align: 'center' },
+    { label: 'Caja',               ancho: 14, align: 'left'   },
+    { label: 'Cajero',             ancho: 18, align: 'left'   },
+    { label: 'Producto',           ancho: 38, align: 'left'   },
+    { label: 'Cantidad',           ancho: 12, align: 'center', formato: 'numero' },
+    { label: 'Total Producto Bs',  ancho: 18, align: 'right', formato: 'moneda' },
+
+    { label: 'Tipo Descuento',     ancho: 18, align: 'center' },
+    { label: 'Valor Descuento',    ancho: 16, align: 'center' },
+    { label: 'Descuento Bs',       ancho: 16, align: 'right', formato: 'moneda' },
+
+    { label: 'QR Bs',              ancho: 12, align: 'right', formato: 'moneda' },
+    { label: 'Efectivo Bs',        ancho: 14, align: 'right', formato: 'moneda' },
+    { label: 'Tarjeta Bs',         ancho: 14, align: 'right', formato: 'moneda' },
+    { label: 'Total Venta Bs',     ancho: 16, align: 'right', formato: 'moneda' },
   ];
 
-  let totQR = 0, totEfectivo = 0, totTarjeta = 0, totTotal = 0;
-  const filas = rows.map(r => {
-    const dt    = r.creado_en ? new Date(r.creado_en) : null;
-    const fecha = dt ? dt.toLocaleDateString('es-BO') : '';
-    const hora  = dt ? dt.toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit' }) : '';
-    const prods = Array.isArray(r.productos)
-      ? r.productos.map(p => `${p.nombre || '?'} x${p.cantidad || 1}`).join(' | ') : '';
-    const qr  = parseFloat(r.monto_qr)       || 0;
-    const ef  = parseFloat(r.monto_efectivo) || 0;
-    const tar = parseFloat(r.monto_tarjeta)  || 0;
-    const tot = parseFloat(r.total)          || 0;
-    totQR += qr; totEfectivo += ef; totTarjeta += tar; totTotal += tot;
-    return [fecha, hora, r.numero_orden || '', r.caja || '', r.cajero_nombre || r.cajero || '', prods, qr, ef, tar, tot];
+  let totQR = 0;
+  let totEfectivo = 0;
+  let totTarjeta = 0;
+  let totTotal = 0;
+  let totProductos = 0;
+  let totDescuentos = 0;
+
+  const filas = [];
+
+  rows.forEach(r => {
+    const dt = r.creado_en ? new Date(r.creado_en) : null;
+
+    const fecha = dt
+      ? dt.toLocaleDateString('es-BO')
+      : '';
+
+    const hora = dt
+      ? dt.toLocaleTimeString('es-BO', {
+          hour: '2-digit',
+          minute: '2-digit'
+        })
+      : '';
+
+    const qr = parseFloat(r.monto_qr) || 0;
+    const ef = parseFloat(r.monto_efectivo) || 0;
+    const tar = parseFloat(r.monto_tarjeta) || 0;
+    const totalVenta = parseFloat(r.total) || 0;
+
+    const descuentoMonto =
+      parseFloat(r.descuento_monto) || 0;
+
+    const descuentoValor =
+      parseFloat(r.descuento_valor) || 0;
+
+    const descuentoTipo =
+      r.descuento_tipo || '';
+
+    totQR += qr;
+    totEfectivo += ef;
+    totTarjeta += tar;
+    totTotal += totalVenta;
+    totDescuentos += descuentoMonto;
+
+    const productos =
+      Array.isArray(r.productos) && r.productos.length
+        ? r.productos
+        : [{
+            nombre: '(sin producto)',
+            qty: 1,
+            precio: 0
+          }];
+
+    productos.forEach((p, index) => {
+      const cantidad =
+        parseFloat(p.qty) ||
+        parseFloat(p.cantidad) ||
+        1;
+
+      const precio =
+        parseFloat(p.precio) ||
+        parseFloat(p.price) ||
+        0;
+
+      const totalProducto = precio * cantidad;
+
+      totProductos += totalProducto;
+
+      const primeraFila = index === 0;
+
+      let valorDescuentoMostrar = '';
+
+      if (primeraFila && descuentoMonto > 0) {
+        if (descuentoTipo === 'porcentaje') {
+          valorDescuentoMostrar = `${descuentoValor}%`;
+        } else {
+          valorDescuentoMostrar = `Bs ${descuentoValor}`;
+        }
+      }
+
+      filas.push([
+        fecha,
+        hora,
+        r.numero_orden || getOrderReference(r.id),
+        r.caja || '',
+        r.cajero_nombre || r.cajero || '',
+        p.nombre || '(sin nombre)',
+        cantidad,
+        totalProducto,
+
+        primeraFila && descuentoMonto > 0
+          ? descuentoTipo
+          : '',
+
+        valorDescuentoMostrar,
+
+        primeraFila && descuentoMonto > 0
+          ? descuentoMonto
+          : '',
+
+        primeraFila ? qr : '',
+        primeraFila ? ef : '',
+        primeraFila ? tar : '',
+        primeraFila ? totalVenta : ''
+      ]);
+    });
   });
 
   await crearExcelProfesional({
-    subtitulo:    'Detalle de Ventas',
+    subtitulo: 'Detalle de Ventas',
     columnas,
     filas,
-    filaTotales:  ['', '', '', '', 'TOTAL GENERAL', '', totQR, totEfectivo, totTarjeta, totTotal],
+
+    filaTotales: [
+      '',
+      '',
+      '',
+      '',
+      '',
+      'TOTAL GENERAL',
+      '',
+      totProductos,
+
+      '',
+      'DESCUENTOS',
+      totDescuentos,
+
+      totQR,
+      totEfectivo,
+      totTarjeta,
+      totTotal
+    ],
+
     nombreArchivo: 'detalle_ventas'
   });
 }
-
 /* ========== EXPORT: VENTAS POR PRODUCTO ========== */
 document.getElementById('export-productos-btn').addEventListener('click', async () => {
   const rows = window._repExportData || repVentas;
-  if (!rows.length) { showToast('Sin ventas para exportar', 2000); return; }
+
+  if (!rows.length) {
+    showToast('Sin ventas para exportar', 2000);
+    return;
+  }
 
   const porProducto = {};
+
   rows.forEach(r => {
-    if (!Array.isArray(r.productos)) return;
+    if (!Array.isArray(r.productos) || !r.productos.length) return;
+
+    const descuentoVenta = parseFloat(r.descuento_monto) || 0;
+
+    // Subtotal original de todos los productos de esta venta
+    const subtotalVenta = r.productos.reduce((sum, p) => {
+      const cantidad =
+        parseFloat(p.qty) ||
+        parseFloat(p.cantidad) ||
+        1;
+
+      const precio =
+        parseFloat(p.precio) ||
+        parseFloat(p.price) ||
+        0;
+
+      return sum + (precio * cantidad);
+    }, 0);
+
     r.productos.forEach(p => {
-      const k = p.nombre || '(sin nombre)';
-      if (!porProducto[k]) porProducto[k] = { qty: 0, total: 0 };
-      porProducto[k].qty   += parseInt(p.qty)    || parseInt(p.cantidad) || 1;
-      porProducto[k].total += (parseFloat(p.precio) || 0) * (parseInt(p.qty) || parseInt(p.cantidad) || 1);
+      const nombre = p.nombre || '(sin nombre)';
+
+      const cantidad =
+        parseFloat(p.qty) ||
+        parseFloat(p.cantidad) ||
+        1;
+
+      const precio =
+        parseFloat(p.precio) ||
+        parseFloat(p.price) ||
+        0;
+
+      const subtotalProducto = precio * cantidad;
+
+      // Repartir proporcionalmente el descuento de la venta
+      let descuentoProducto = 0;
+
+      if (descuentoVenta > 0 && subtotalVenta > 0) {
+        descuentoProducto =
+          descuentoVenta * (subtotalProducto / subtotalVenta);
+      }
+
+      const totalNeto =
+        Math.max(0, subtotalProducto - descuentoProducto);
+
+      if (!porProducto[nombre]) {
+        porProducto[nombre] = {
+          qty: 0,
+          subtotal: 0,
+          descuento: 0,
+          totalNeto: 0
+        };
+      }
+
+      porProducto[nombre].qty += cantidad;
+      porProducto[nombre].subtotal += subtotalProducto;
+      porProducto[nombre].descuento += descuentoProducto;
+      porProducto[nombre].totalNeto += totalNeto;
     });
   });
 
   const columnas = [
-    { label: '#',         ancho: 6,  align: 'center' },
-    { label: 'Producto',  ancho: 36, align: 'left'   },
-    { label: 'Cantidad',  ancho: 12, align: 'center', formato: 'numero' },
-    { label: 'Total Bs',  ancho: 16, align: 'right',  formato: 'moneda' },
+    { label: '#',             ancho: 6,  align: 'center' },
+    { label: 'Producto',      ancho: 36, align: 'left'   },
+    { label: 'Cantidad',      ancho: 12, align: 'center', formato: 'numero' },
+    { label: 'Subtotal Bs',   ancho: 16, align: 'right',  formato: 'moneda' },
+    { label: '¿Descuento?',   ancho: 15, align: 'center' },
+    { label: 'Descuento Bs',  ancho: 16, align: 'right',  formato: 'moneda' },
+    { label: 'Total Neto Bs', ancho: 18, align: 'right',  formato: 'moneda' }
   ];
 
-  let idx = 1, grandTotal = 0;
+  let idx = 1;
+  let totalCantidad = 0;
+  let totalSubtotal = 0;
+  let totalDescuento = 0;
+  let totalNeto = 0;
+
   const filas = Object.entries(porProducto)
-    .sort((a, b) => b[1].total - a[1].total)
+    .sort((a, b) => b[1].totalNeto - a[1].totalNeto)
     .map(([nombre, d]) => {
-      grandTotal += d.total;
-      return [idx++, nombre, d.qty, d.total];
+
+      totalCantidad += d.qty;
+      totalSubtotal += d.subtotal;
+      totalDescuento += d.descuento;
+      totalNeto += d.totalNeto;
+
+      return [
+        idx++,
+        nombre,
+        d.qty,
+        d.subtotal,
+        d.descuento > 0 ? 'SÍ' : 'NO',
+        d.descuento,
+        d.totalNeto
+      ];
     });
 
   await crearExcelProfesional({
-    subtitulo:    'Ventas por Producto',
+    subtitulo: 'Ventas por Producto',
+
     columnas,
+
     filas,
-    filaTotales:  ['', 'TOTAL GENERAL', filas.reduce((s, f) => s + f[2], 0), grandTotal],
+
+    filaTotales: [
+      '',
+      'TOTAL GENERAL',
+      totalCantidad,
+      totalSubtotal,
+      '',
+      totalDescuento,
+      totalNeto
+    ],
+
     nombreArchivo: 'ventas_por_producto'
   });
 });
-
 /* ========== EXPORT: TOTAL POR CAJA ========== */
 document.getElementById('export-cajas-btn').addEventListener('click', async () => {
   const rows = window._repExportData || repVentas;
@@ -3251,7 +3776,7 @@ function renderOrdenes() {
           <div class="ord-prods">${prods}</div>
           <div class="ord-total-row">
             <span class="ord-metodo">${(r.metodo_pago||'—').toUpperCase()}</span>
-            <span class="ord-total">Bs ${(+r.total).toFixed(2)}</span>
+            <span class="ord-total">Bs ${fmt(r.total)}</span>
           </div>
         </div>
         <div class="ord-right">
@@ -3368,7 +3893,7 @@ function renderMonitorList(turnos) {
       <div class="monitor-card-left">
         <div class="monitor-card-caja">${t.caja || '—'}</div>
         <div class="monitor-card-meta">${t.nombre || t.cajero} · desde ${desde}</div>
-        <div class="monitor-card-ap">Apertura: Bs ${parseFloat(t.monto_apertura||0).toFixed(2)}</div>
+        <div class="monitor-card-ap">Apertura: Bs ${fmt(t.monto_apertura)}</div>
       </div>
       <div>${(esMia && !esAdminMonitor)
         ? '<span class="monitor-card-badge">Mi caja</span>'
@@ -3633,7 +4158,7 @@ document.getElementById('cr-btn-confirmar').addEventListener('click', async () =
   pa.dataset.printFormat = 'a4';
   pa.style.display = 'none';
   pa.innerHTML = `
-    <div class="pc-brand">MAMA ORURO</div>
+    <div class="pc-brand">MAMA POTOSI</div>
     <div class="pc-titulo">CIERRE DE CAJA</div>
     <div class="pc-ticket-meta">
       <span>CAJA: ${formatReceiptCaja(t.caja)}</span>
