@@ -2,12 +2,12 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=overlays-content">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=overlays-content">
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
-  
+
   <!-- iOS / Apple -->
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <!-- Favicon navegador -->
@@ -15,7 +15,7 @@
   <!-- PWA manifest -->
   <link rel="manifest" href="manifest.json">
   <meta name="theme-color" content="#000000">
-  
+
 <title>Pa𝘺POS</title>
 <link rel="stylesheet" href="./style.css">
 </head>
@@ -144,7 +144,7 @@
         </div>
 
         <div class="totals">
-          
+
 
           <div class="tot-row">
             <span class="tot-lbl">ÍTEMS</span>
@@ -371,105 +371,320 @@
   </div>
 </div>
 
-<!-- REPORTES MODAL -->
-<div id="reportes-modal">
-  <div class="rep-panel" style="width:min(520px,96vw)">
-    <div class="modal-hd">
-      <div>
-        <div class="modal-hd-title">📋 Reportes</div>
-        <div style="font-size:13px;color:var(--text-secondary);margin-top:3px;">Exporta tus ventas en Excel profesional (.xlsx)</div>
-      </div>
-      <button class="modal-close" id="rep-close">✕</button>
-    </div>
+  <!-- REPORTES MODAL -->
+  <div id="reportes-modal">
+    <div class="rep-panel">
 
-    <!-- Paso 1: Tipo de reporte -->
-    <div>
-      <div class="rep-step-label">1 — Tipo de reporte</div>
-      <div style="display:flex;flex-direction:column;gap:8px;" id="rep-tipo-opts">
-        <button class="rep-option-btn" data-tipo="productos">
-          <div class="rep-opt-icon"><img src="https://img.icons8.com/?size=100&id=DQwSyRV75j0z&format=png&color=FFFFFF"></div>
-          <div class="rep-opt-info">
-            <div class="rep-opt-title">Ventas por Producto</div>
-            <div class="rep-opt-sub">Cantidad y monto total de cada producto vendido</div>
-          </div>
-          <div class="rep-opt-check">✓</div>
-        </button>
-        <button class="rep-option-btn" data-tipo="cajas">
-          <div class="rep-opt-icon"><img src="https://img.icons8.com/?size=100&id=DQwSyRV75j0z&format=png&color=FFFFFF"></div>
-          <div class="rep-opt-info">
-            <div class="rep-opt-title">Total por Caja</div>
-            <div class="rep-opt-sub">Resumen de ingresos QR, efectivo y tarjeta por caja</div>
-          </div>
-          <div class="rep-opt-check">✓</div>
-        </button>
-        <button class="rep-option-btn" data-tipo="detalle">
-          <div class="rep-opt-icon"><img src="https://img.icons8.com/?size=100&id=DQwSyRV75j0z&format=png&color=FFFFFF"></div>
-          <div class="rep-opt-info">
-            <div class="rep-opt-title">Detalle de Ventas</div>
-            <div class="rep-opt-sub">Cada venta: cajero, productos, método de pago y monto</div>
-          </div>
-          <div class="rep-opt-check">✓</div>
+      <div class="rep-main-head">
+        <div class="rep-main-title">REPORTES</div>
+
+        <button
+          class="rep-main-close"
+          id="rep-close"
+          type="button"
+          aria-label="Cerrar reportes"
+        >
+          ×
         </button>
       </div>
-    </div>
 
-    <div class="hr"></div>
+      <div class="rep-main-options" id="rep-tipo-opts">
 
-    <!-- Paso 2: período; el calendario se abre en un modal pequeño -->
-    <div id="rep-rango-wrap" style="opacity:.32;pointer-events:none;transition:opacity .22s;">
-      <div class="rep-step-label">2 — Período</div>
-      <button type="button" class="rep-date-trigger" id="rep-date-trigger">
-        <span class="rep-date-trigger-icon">CAL</span>
-        <span class="rep-date-trigger-copy">
-          <strong>Elegir fechas</strong>
-          <span id="rep-date-summary">Selecciona una fecha o un rango</span>
-        </span>
-        <span class="rep-date-trigger-arrow">›</span>
-      </button>
-    </div>
+        <button
+          class="rep-main-option"
+          type="button"
+          data-tipo="productos"
+        >
+          <span class="rep-main-option-title">
+            PRODUCTOS
+          </span>
 
-    <!-- Botón descarga (oculto hasta elegir ambos) -->
-    <div id="rep-download-wrap" style="display:none;">
-      <button class="export-btn" id="rep-download-btn" style="margin-top:0;width:100%;font-size:15px;padding:16px 20px;display:flex;align-items:center;justify-content:center;gap:10px;">
-        <span style="font-size:18px;">⬇</span> <span id="rep-download-lbl">Descargar Reporte</span>
-      </button>
-    </div>
+          <span class="rep-main-option-check">
+            ✓
+          </span>
+        </button>
 
-    <div class="rep-calendar-popover" id="rep-calendar-popover" aria-hidden="true">
-      <div class="rep-date-dialog" role="dialog" aria-modal="true" aria-labelledby="rep-cal-title">
-        <div class="rep-date-dialog-head">
-          <div>
-            <div class="rep-date-dialog-kicker">PERÍODO DEL REPORTE</div>
-            <strong id="rep-cal-title">Selecciona las fechas</strong>
-          </div>
-          <button type="button" class="modal-close rep-date-dialog-close" id="rep-date-close" aria-label="Cerrar calendario">✕</button>
-        </div>
-        <div class="rep-calendar" aria-label="Calendario de fechas del reporte">
-          <div class="rep-calendar-head">
-            <button type="button" class="rep-cal-nav" id="rep-cal-prev" aria-label="Mes anterior">‹</button>
-            <strong id="rep-cal-month">—</strong>
-            <button type="button" class="rep-cal-nav" id="rep-cal-next" aria-label="Mes siguiente">›</button>
-          </div>
-          <div class="rep-cal-weekdays">
-            <span>Dom</span><span>Lun</span><span>Mar</span><span>Mié</span>
-            <span>Jue</span><span>Vie</span><span>Sáb</span>
-          </div>
-          <div class="rep-calendar-grid" id="rep-calendar-grid"></div>
-        </div>
-        <div class="rep-date-footer">
-          <span id="rep-date-dialog-summary">Selecciona una fecha o un rango</span>
-          <button type="button" class="rep-date-clear" id="rep-date-clear">Limpiar</button>
-        </div>
-        <button type="button" class="rep-date-apply" id="rep-date-apply">Aplicar fechas</button>
+        <button
+          class="rep-main-option"
+          type="button"
+          data-tipo="cajas"
+        >
+          <span class="rep-main-option-title">
+            POR CAJA
+          </span>
+
+          <span class="rep-main-option-check">
+            ✓
+          </span>
+        </button>
+
+        <button
+          class="rep-main-option"
+          type="button"
+          data-tipo="detalle"
+        >
+          <span class="rep-main-option-title">
+            DETALLE
+          </span>
+
+          <span class="rep-main-option-check">
+            ✓
+          </span>
+        </button>
+
       </div>
-    </div>
 
-    <!-- Botones funcionales ocultos (mantienen sus listeners) -->
-    <button id="export-productos-btn" style="display:none;"></button>
-    <button id="export-cajas-btn" style="display:none;"></button>
+    </div>
   </div>
-</div>
 
+
+  <!-- MODAL FECHA DEL REPORTE -->
+  <div
+    class="rep-flow-modal"
+    id="rep-calendar-popover"
+    aria-hidden="true"
+  >
+    <div
+      class="rep-flow-panel rep-date-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="rep-cal-title"
+    >
+
+      <div class="rep-flow-head">
+        <div>
+          <div class="rep-flow-kicker">
+            FECHA DEL REPORTE
+          </div>
+
+          <div
+            class="rep-flow-title"
+            id="rep-cal-title"
+          >
+            Selecciona el evento
+          </div>
+        </div>
+
+        <button
+          type="button"
+          class="rep-flow-close"
+          id="rep-date-close"
+          aria-label="Cerrar calendario"
+        >
+          ×
+        </button>
+      </div>
+
+      <div
+        class="rep-calendar"
+        aria-label="Calendario de fechas del reporte"
+      >
+        <div class="rep-calendar-head">
+
+          <button
+            type="button"
+            class="rep-cal-nav"
+            id="rep-cal-prev"
+            aria-label="Mes anterior"
+          >
+            ‹
+          </button>
+
+          <strong id="rep-cal-month">
+            —
+          </strong>
+
+          <button
+            type="button"
+            class="rep-cal-nav"
+            id="rep-cal-next"
+            aria-label="Mes siguiente"
+          >
+            ›
+          </button>
+
+        </div>
+
+        <div class="rep-cal-weekdays">
+          <span>Dom</span>
+          <span>Lun</span>
+          <span>Mar</span>
+          <span>Mié</span>
+          <span>Jue</span>
+          <span>Vie</span>
+          <span>Sáb</span>
+        </div>
+
+        <div
+          class="rep-calendar-grid"
+          id="rep-calendar-grid"
+        ></div>
+      </div>
+
+      <div class="rep-date-footer">
+        <span id="rep-date-dialog-summary">
+          Selecciona una fecha
+        </span>
+
+        <button
+          type="button"
+          class="rep-date-clear"
+          id="rep-date-clear"
+        >
+          Limpiar
+        </button>
+      </div>
+
+      <button
+        type="button"
+        class="rep-date-apply"
+        id="rep-date-apply"
+      >
+        CONTINUAR
+      </button>
+
+    </div>
+  </div>
+
+
+  <!-- MODAL SELECCIÓN DE CAJA -->
+  <div
+    class="rep-flow-modal"
+    id="rep-caja-modal"
+    aria-hidden="true"
+  >
+    <div class="rep-flow-panel rep-caja-panel">
+
+      <div class="rep-flow-head">
+        <div>
+          <div class="rep-flow-kicker">
+            CAJA
+          </div>
+
+          <div class="rep-flow-title">
+            Selecciona una caja
+          </div>
+        </div>
+
+        <button
+          type="button"
+          class="rep-flow-close"
+          id="rep-caja-close"
+          aria-label="Cerrar selección de caja"
+        >
+          ×
+        </button>
+      </div>
+
+      <div class="rep-caja-options">
+
+        <button
+          type="button"
+          class="rep-caja-option rep-caja-all"
+          data-caja="todas"
+        >
+          TODAS LAS CAJAS
+        </button>
+
+        <div class="rep-caja-grid">
+
+          <button
+            type="button"
+            class="rep-caja-option"
+            data-caja="1"
+          >
+            CAJA 1
+          </button>
+
+          <button
+            type="button"
+            class="rep-caja-option"
+            data-caja="2"
+          >
+            CAJA 2
+          </button>
+
+          <button
+            type="button"
+            class="rep-caja-option"
+            data-caja="3"
+          >
+            CAJA 3
+          </button>
+
+          <button
+            type="button"
+            class="rep-caja-option"
+            data-caja="4"
+          >
+            CAJA 4
+          </button>
+
+          <button
+            type="button"
+            class="rep-caja-option rep-caja-last"
+            data-caja="5"
+          >
+            CAJA 5
+          </button>
+
+        </div>
+
+      </div>
+
+    </div>
+  </div>
+
+
+  <!-- ELEMENTOS FUNCIONALES OCULTOS -->
+  <select id="rep-caja-select" style="display:none;">
+    <option value="todas">Todas las cajas</option>
+    <option value="1">Caja 1</option>
+    <option value="2">Caja 2</option>
+    <option value="3">Caja 3</option>
+    <option value="4">Caja 4</option>
+    <option value="5">Caja 5</option>
+  </select>
+
+  <div
+    id="rep-rango-wrap"
+    style="display:none;"
+  ></div>
+
+  <button
+    id="rep-date-trigger"
+    type="button"
+    style="display:none;"
+  ></button>
+
+  <span
+    id="rep-date-summary"
+    style="display:none;"
+  ></span>
+
+  <div
+    id="rep-download-wrap"
+    style="display:none;"
+  >
+    <button
+      id="rep-download-btn"
+      type="button"
+    >
+      <span id="rep-download-lbl">
+        Descargar Reporte
+      </span>
+    </button>
+  </div>
+
+  <button
+    id="export-productos-btn"
+    style="display:none;"
+  ></button>
+
+  <button
+    id="export-cajas-btn"
+    style="display:none;"
+  ></button>
 <!-- ========== CAJA MODAL ========== -->
 <div id="caja-modal">
   <div class="caja-panel">
